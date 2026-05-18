@@ -7,7 +7,7 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from datetime import datetime, timedelta
 
-st.set_page_config(layout="wide", page_title="台指多因子戰情室 (直覺圖表版)")
+st.set_page_config(layout="wide", page_title="台指多因子戰情室 (直覺六圖表版)")
 
 # ==========================================
 # 1. 資料獲取模組 (Yahoo + FinMind 獨立防呆抽取)
@@ -48,7 +48,6 @@ def fetch_all_data():
     params = {"dataset": "TaiwanStockTotalInstitutionalInvestors", "start_date": start_date.strftime("%Y-%m-%d"), "token": FINMIND_TOKEN}
     headers = {"User-Agent": "Mozilla/5.0"}
     
-    inst_snapshot = {'date': '資料異常', '外資': 0.0, '投信': 0.0, '自營商': 0.0}
     foreign_df = pd.DataFrame()
     
     try:
@@ -57,21 +56,7 @@ def fetch_all_data():
         if data.get('msg') == 'success' and len(data.get('data', [])) > 0:
             df_fm = pd.DataFrame(data['data'])
             
-            # 獨立抓取各法人最新一筆 (解決時間差導致的 0.00 問題)
-            def get_latest_net(kw, ex=''):
-                m = df_fm['name'].str.contains(kw, case=False, na=False)
-                if ex: m = m & ~df_fm['name'].str.contains(ex, case=False, na=False)
-                sub_df = df_fm[m].sort_values('date')
-                if sub_df.empty: return 0.0, 'N/A'
-                return (sub_df['buy'].iloc[-1] - sub_df['sell'].iloc[-1]) / 100000000, sub_df['date'].iloc[-1]
-
-            f_net, f_date = get_latest_net('外資|Foreign_Investor', '自營商')
-            t_net, _ = get_latest_net('投信|Investment_Trust')
-            d_net, _ = get_latest_net('自營商|Dealer', '外資|Foreign')
-            
-            inst_snapshot = {'date': f_date, '外資': f_net, '投信': t_net, '自營商': d_net}
-
-            # 建立外資歷史序列供 Z-score 使用
+            # 建立外資歷史序列
             f_mask = df_fm['name'].str.contains('外資|Foreign_Investor', case=False, na=False) & ~df_fm['name'].str.contains('自營商', case=False, na=False)
             foreign_df = df_fm[f_mask].copy()
             if not foreign_df.empty:
@@ -79,44 +64,53 @@ def fetch_all_data():
                 foreign_df['Foreign_Net'] = (foreign_df['buy'] - foreign_df['sell']) / 100000000
                 foreign_df.set_index('Date', inplace=True)
     except Exception as e:
-        st.warning("籌碼 API 連線異常，暫時略過籌碼因子。")
+        pass
 
     if not foreign_df.empty:
         final_df = mkt_df.join(foreign_df[['Foreign_Net']], how='outer').ffill().dropna()
+        has_foreign = True
     else:
         final_df = mkt_df.ffill().dropna()
+        has_foreign = False
         
-    return final_df, inst_snapshot
+    return final_df, has_foreign
 
 # ==========================================
 # 2. 核心因子引擎 (計算 8 大因子)
 # ==========================================
-def calculate_v11_signals(df):
+def calculate_v11_signals(df, has_foreign):
     data = df.copy()
     
+    # 1. 大盤
     data['台指_60MA'] = data['TWII'].rolling(60).mean()
     data['台指_季線斜率'] = data['台指_60MA'].diff(5) / data['台指_60MA'].shift(5) * 100
     data['台指_乖離率'] = (data['TWII'] - data['台指_60MA']) / data['台指_60MA'] * 100
     
+    # 2. 費半
+    data['費半_20MA'] = data['SOX'].rolling(20).mean()
+    data['費半_60MA'] = data['SOX'].rolling(60).mean()
+    
+    # 3. 台積電
+    data['台積電_20MA'] = data['TSMC'].rolling(20).mean()
+    data['台積電量_10MA'] = data['TSMC_Vol'].rolling(10).mean()
+    
+    # 4. 電金比
     data['電金比'] = data['ELEC'] / data['FIN']
     data['電金比_20MA'] = data['電金比'].rolling(20).mean()
     
-    if 'Foreign_Net' in data.columns:
+    # 5. 外資 Z-score
+    if has_foreign and 'Foreign_Net' in data.columns:
         data['外資_120MA'] = data['Foreign_Net'].rolling(120, min_periods=10).mean()
         data['外資_120STD'] = data['Foreign_Net'].rolling(120, min_periods=10).std().replace(0, np.nan)
         data['外資_Zscore'] = (data['Foreign_Net'] - data['外資_120MA']) / data['外資_120STD']
     else:
+        data['Foreign_Net'] = 0.0
         data['外資_Zscore'] = 0.0
-    
-    data['費半_20MA'] = data['SOX'].rolling(20).mean()
-    data['費半_60MA'] = data['SOX'].rolling(60).mean()
-    
+        
+    # 6. ADR Z-score
     data['ADR_120MA'] = data['TSM_ADR'].rolling(120, min_periods=10).mean()
     data['ADR_120STD'] = data['TSM_ADR'].rolling(120, min_periods=10).std().replace(0, np.nan)
     data['ADR_Zscore'] = (data['TSM_ADR'] - data['ADR_120MA']) / data['ADR_120STD']
-    
-    data['台積電_20MA'] = data['TSMC'].rolling(20).mean()
-    data['台積電量_10MA'] = data['TSMC_Vol'].rolling(10).mean()
     
     if data.empty or pd.isna(data['台指_60MA'].iloc[-1]): return data, 0.0, 0.0
 
@@ -146,7 +140,7 @@ def calculate_v11_signals(df):
     return data, long_score, short_score
 
 # ==========================================
-# 3. 畫面呈現與圖表繪製
+# 3. 畫面呈現與 6 大圖表繪製
 # ==========================================
 def main():
     st.title("📊 台指多因子量化戰情室")
@@ -157,85 +151,98 @@ def main():
             st.cache_data.clear()
             st.rerun()
     with col_time:
-        st.write(f"系統最後更新時間: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+        st.write(f"最後更新時間: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
 
-    with st.spinner('正在計算八大因子與生成圖表...'):
-        data, inst_snapshot = fetch_all_data()
-        data, long_score, short_score = calculate_v11_signals(data)
+    with st.spinner('正在計算因子與生成圖表...'):
+        data, has_foreign = fetch_all_data()
+        if data.empty:
+            st.error("市場資料載入失敗！")
+            return
+        data, long_score, short_score = calculate_v11_signals(data, has_foreign)
 
     # ------------------------------------------
     # 區塊一：開頭直球對決 (訊號情境判斷)
     # ------------------------------------------
     LONG_ENTRY, SHORT_ENTRY = 4.0, 6.0
     
+    st.markdown("### 🎯 策略當下訊號")
     if long_score >= LONG_ENTRY:
-        st.success(f"🔥 **【偏多情境】觸發做多訊號！** (多方總分: {long_score:.1f} / 空方總分: {short_score:.1f})")
+        st.success(f"🔥 **【偏多情境】觸發做多訊號！** (多方得分: {long_score:.1f} / 空方得分: {short_score:.1f})")
     elif short_score >= SHORT_ENTRY:
-        st.error(f"⚠️ **【偏空情境】觸發做空訊號！** (空方總分: {short_score:.1f} / 多方總分: {long_score:.1f})")
+        st.error(f"⚠️ **【偏空情境】觸發做空訊號！** (空方得分: {short_score:.1f} / 多方得分: {long_score:.1f})")
     else:
-        st.info(f"⚖️ **【震盪整理】維持空手觀望。** (多方總分: {long_score:.1f} / 空方總分: {short_score:.1f})")
-
-    st.markdown("---")
-
-    # 法人現況小儀表板
-    st.caption(f"籌碼發布日期: {inst_snapshot.get('date', '未知')}")
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("外資現貨 (億)", f"{inst_snapshot.get('外資', 0):.2f}")
-    c2.metric("投信現貨 (億)", f"{inst_snapshot.get('投信', 0):.2f}")
-    c3.metric("自營商現貨 (億)", f"{inst_snapshot.get('自營商', 0):.2f}")
-    z_score = data['外資_Zscore'].iloc[-1] if not data.empty and '外資_Zscore' in data else 0.0
-    c4.metric("外資動能 Z-Score", f"{z_score:.2f}")
+        st.info(f"⚖️ **【震盪整理】維持空手觀望。** (多方得分: {long_score:.1f} / 空方得分: {short_score:.1f})")
 
     st.markdown("---")
 
     # ------------------------------------------
-    # 區塊二：八大因子圖表整併
+    # 區塊二：六大獨立圖表展示
     # ------------------------------------------
-    st.header("📈 核心因子視覺化圖表")
-
-    if data.empty:
-        st.error("資料不足，無法繪製圖表。")
-        return
-
-    # [圖表 1] 大盤結構 (F1 季線 + F8 乖離率)
-    st.subheader("① 大盤結構與乖離 (因子 1, 8)")
-    fig1 = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.7, 0.3], vertical_spacing=0.05)
-    fig1.add_trace(go.Scatter(x=data.index, y=data['TWII'], name="加權指數", line=dict(color='white')), row=1, col=1)
-    fig1.add_trace(go.Scatter(x=data.index, y=data['台指_60MA'], name="季線(60MA)", line=dict(color='orange', dash='dash')), row=1, col=1)
     
-    bias_colors = ['red' if b > 8 else ('green' if b < -8 else 'gray') for b in data['台指_乖離率']]
+    # 1. 台股大盤 vs 季線還有乖離率
+    st.subheader("1. 台股大盤與季線乖離率")
+    fig1 = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.7, 0.3], vertical_spacing=0.05)
+    fig1.add_trace(go.Scatter(x=data.index, y=data['TWII'], name="加權指數", line=dict(color='silver')), row=1, col=1)
+    fig1.add_trace(go.Scatter(x=data.index, y=data['台指_60MA'], name="季線(60MA)", line=dict(color='orange', dash='dash')), row=1, col=1)
+    bias_colors = ['#ef4444' if b > 8 else ('#22c55e' if b < -8 else '#555555') for b in data['台指_乖離率']]
     fig1.add_trace(go.Bar(x=data.index, y=data['台指_乖離率'], name="季線乖離率(%)", marker_color=bias_colors), row=2, col=1)
-    fig1.add_hline(y=8, line_dash="dot", line_color="red", row=2, col=1)
-    fig1.add_hline(y=-8, line_dash="dot", line_color="green", row=2, col=1)
-    fig1.update_layout(height=450, margin=dict(t=30, b=10), hovermode="x unified")
+    fig1.add_hline(y=8, line_dash="dot", line_color="red", row=2, col=1, annotation_text="超買 (>8%)")
+    fig1.add_hline(y=-8, line_dash="dot", line_color="green", row=2, col=1, annotation_text="超賣 (<-8%)")
+    fig1.update_layout(height=450, margin=dict(t=10, b=10), hovermode="x unified")
     st.plotly_chart(fig1, use_container_width=True)
 
-    # [圖表 2] 半導體雙星 (F4 費半 + F6 台積電 + F7 台積電爆量)
-    st.subheader("② 半導體雙星動能 (因子 4, 6, 7)")
-    fig2 = make_subplots(rows=3, cols=1, shared_xaxes=True, row_heights=[0.4, 0.4, 0.2], vertical_spacing=0.05)
-    fig2.add_trace(go.Scatter(x=data.index, y=data['SOX'], name="費半指數", line=dict(color='cyan')), row=1, col=1)
-    fig2.add_trace(go.Scatter(x=data.index, y=data['費半_20MA'], name="費半20MA", line=dict(color='yellow', dash='dot')), row=1, col=1)
-    
-    fig2.add_trace(go.Scatter(x=data.index, y=data['TSMC'], name="台積電現貨", line=dict(color='red')), row=2, col=1)
-    fig2.add_trace(go.Scatter(x=data.index, y=data['台積電_20MA'], name="台積電20MA", line=dict(color='orange', dash='dot')), row=2, col=1)
-    
-    vol_colors = ['#ef4444' if v > 1.5 * m else '#555555' for v, m in zip(data['TSMC_Vol'], data['台積電量_10MA'])]
-    fig2.add_trace(go.Bar(x=data.index, y=data['TSMC_Vol'], name="台積電成交量", marker_color=vol_colors), row=3, col=1)
-    fig2.update_layout(height=600, margin=dict(t=30, b=10), hovermode="x unified")
+    # 2. 費城半導體 及費半月線及季線
+    st.subheader("2. 費城半導體 (SOX) 均線結構")
+    fig2 = go.Figure()
+    fig2.add_trace(go.Scatter(x=data.index, y=data['SOX'], name="費半指數", line=dict(color='cyan')))
+    fig2.add_trace(go.Scatter(x=data.index, y=data['費半_20MA'], name="月線(20MA)", line=dict(color='yellow', dash='dot')))
+    fig2.add_trace(go.Scatter(x=data.index, y=data['費半_60MA'], name="季線(60MA)", line=dict(color='orange', dash='dash')))
+    fig2.update_layout(height=400, margin=dict(t=10, b=10), hovermode="x unified")
     st.plotly_chart(fig2, use_container_width=True)
 
-    # [圖表 3] 資金與籌碼流向 (F2 電金比 + F3 外資Z + F5 ADR_Z)
-    st.subheader("③ 資金與籌碼流向 (因子 2, 3, 5)")
-    fig3 = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.5, 0.5], vertical_spacing=0.08)
-    fig3.add_trace(go.Scatter(x=data.index, y=data['電金比'], name="電金比", line=dict(color='magenta')), row=1, col=1)
-    fig3.add_trace(go.Scatter(x=data.index, y=data['電金比_20MA'], name="電金比20MA", line=dict(color='purple', dash='dot')), row=1, col=1)
-    
-    fig3.add_trace(go.Scatter(x=data.index, y=data['外資_Zscore'], name="外資 Z-score", line=dict(color='#22c55e')), row=2, col=1)
-    fig3.add_trace(go.Scatter(x=data.index, y=data['ADR_Zscore'], name="ADR Z-score", line=dict(color='#3b82f6')), row=2, col=1)
-    fig3.add_hline(y=1.5, line_dash="dot", line_color="red", row=2, col=1)
-    fig3.add_hline(y=-1.5, line_dash="dot", line_color="green", row=2, col=1)
-    fig3.update_layout(height=500, margin=dict(t=30, b=10), hovermode="x unified")
+    # 3. 台積電走勢 及台積電月線、台積電量能(爆量翻紅)
+    st.subheader("3. 台積電價格與爆量偵測")
+    fig3 = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.7, 0.3], vertical_spacing=0.05)
+    fig3.add_trace(go.Scatter(x=data.index, y=data['TSMC'], name="台積電現貨", line=dict(color='red')), row=1, col=1)
+    fig3.add_trace(go.Scatter(x=data.index, y=data['台積電_20MA'], name="月線(20MA)", line=dict(color='orange', dash='dot')), row=1, col=1)
+    vol_colors = ['#ef4444' if v > 1.5 * m else '#555555' for v, m in zip(data['TSMC_Vol'], data['台積電量_10MA'])]
+    fig3.add_trace(go.Bar(x=data.index, y=data['TSMC_Vol'], name="成交量 (紅柱為爆量)", marker_color=vol_colors), row=2, col=1)
+    fig3.update_layout(height=450, margin=dict(t=10, b=10), hovermode="x unified")
     st.plotly_chart(fig3, use_container_width=True)
+
+    # 4. 電金比，電金比月線
+    st.subheader("4. 資金輪動：電金比")
+    fig4 = go.Figure()
+    fig4.add_trace(go.Scatter(x=data.index, y=data['電金比'], name="電金比", line=dict(color='magenta')))
+    fig4.add_trace(go.Scatter(x=data.index, y=data['電金比_20MA'], name="月線(20MA)", line=dict(color='purple', dash='dash')))
+    fig4.update_layout(height=350, margin=dict(t=10, b=10), hovermode="x unified")
+    st.plotly_chart(fig4, use_container_width=True)
+
+    # 5. 外資買賣超 vs外資Z分數(進出場虛線)
+    st.subheader("5. 籌碼動能：外資買賣超與 Z-Score")
+    if has_foreign:
+        fig5 = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.6, 0.4], vertical_spacing=0.05)
+        f_colors = ['#ef4444' if val > 0 else '#22c55e' for val in data['Foreign_Net']]
+        fig5.add_trace(go.Bar(x=data.index, y=data['Foreign_Net'], name="外資淨買賣(億)", marker_color=f_colors), row=1, col=1)
+        fig5.add_trace(go.Scatter(x=data.index, y=data['外資_Zscore'], name="外資 Z-score", line=dict(color='#3b82f6')), row=2, col=1)
+        fig5.add_hline(y=1.5, line_dash="dot", line_color="red", row=2, col=1, annotation_text="多頭觸發 (+1.5)")
+        fig5.add_hline(y=-1.5, line_dash="dot", line_color="green", row=2, col=1, annotation_text="空頭觸發 (-1.5)")
+        fig5.update_layout(height=450, margin=dict(t=10, b=10), hovermode="x unified")
+        st.plotly_chart(fig5, use_container_width=True)
+    else:
+        st.warning("⚠️ 無法獲取 FinMind 外資歷史資料，此圖表暫停顯示。")
+
+    # 6. 台積電ADR、台積電ADRZ分數(進出場虛線)
+    st.subheader("6. 跨市場溢價：台積電 ADR 與 Z-Score")
+    fig6 = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.6, 0.4], vertical_spacing=0.05)
+    fig6.add_trace(go.Scatter(x=data.index, y=data['TSM_ADR'], name="台積電 ADR", line=dict(color='lightblue')), row=1, col=1)
+    fig6.add_trace(go.Scatter(x=data.index, y=data['ADR_120MA'], name="半年線(120MA)", line=dict(color='gray', dash='dash')), row=1, col=1)
+    fig6.add_trace(go.Scatter(x=data.index, y=data['ADR_Zscore'], name="ADR Z-score", line=dict(color='#eab308')), row=2, col=1)
+    # ADR 策略的門檻是 +1.0 (多) 與 -1.0 (空)
+    fig6.add_hline(y=1.0, line_dash="dot", line_color="red", row=2, col=1, annotation_text="多頭觸發 (+1.0)")
+    fig6.add_hline(y=-1.0, line_dash="dot", line_color="green", row=2, col=1, annotation_text="空頭觸發 (-1.0)")
+    fig6.update_layout(height=450, margin=dict(t=10, b=10), hovermode="x unified")
+    st.plotly_chart(fig6, use_container_width=True)
 
 if __name__ == "__main__":
     main()
