@@ -5,16 +5,15 @@ import numpy as np
 import requests
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-from datetime import datetime, timedelta  # 統一使用這組 import，避免模組衝突
+from datetime import datetime, timedelta
 
-st.set_page_config(layout="wide", page_title="台指多因子戰情室 (完整籌碼版)")
+st.set_page_config(layout="wide", page_title="台指多因子戰情室 (強韌容錯版)")
 
 # ==========================================
 # 1. 資料獲取模組 (Yahoo Finance + FinMind)
 # ==========================================
 @st.cache_data(ttl=3600)
 def fetch_market_data():
-    """使用 yfinance 抓取價格歷史資料"""
     end_date = datetime.now()
     start_date = end_date - timedelta(days=250)
     
@@ -26,31 +25,26 @@ def fetch_market_data():
             df = yf.download(ticker, start=start_date, end=end_date, progress=False)
             if df.empty: continue
 
-            # 清除時區避免合併報錯
             if df.index.tz is not None:
                 df.index = df.index.tz_localize(None)
             
-            # yfinance 新版 MultiIndex 防呆
             if isinstance(df.columns, pd.MultiIndex):
                 close_series = df['Close'][ticker].rename(name)
             else:
                 close_series = df['Close'].rename(name)
             
-            # 日期對齊 Outer Join
             if mkt_df.empty:
                 mkt_df = pd.DataFrame(close_series)
             else:
                 mkt_df = mkt_df.join(close_series, how='outer')
                 
         except Exception as e:
-            st.warning(f"抓取 {name} 失敗: {e}")
+            st.warning(f"Yahoo 抓取 {name} 失敗: {e}")
 
-    # 向下填補並剔除空值
     return mkt_df.ffill().dropna()
 
 @st.cache_data(ttl=3600)
 def fetch_finmind_historical():
-    """使用 FinMind API 抓取大盤三大法人歷史資料 (過去250天) - 安全防呆版"""
     url = "https://api.finmindtrade.com/api/v4/data"
     start_date = (datetime.now() - timedelta(days=250)).strftime("%Y-%m-%d")
     
@@ -63,27 +57,25 @@ def fetch_finmind_historical():
         res = requests.get(url, params=params, timeout=10)
         data = res.json()
         
-        if data.get('msg') == 'success' and len(data.get('data', [])) > 0:
+        # 檢查是否被 FinMind 限制流量
+        if data.get('msg') != 'success':
+            st.warning(f"FinMind API 警告: {data.get('msg', '未知錯誤')} (可能達免費呼叫上限)")
+            return pd.DataFrame(), {}
+            
+        if len(data.get('data', [])) > 0:
             df = pd.DataFrame(data['data'])
             
-            if df.empty:
-                return pd.DataFrame(), {}
+            if df.empty: return pd.DataFrame(), {}
             
-            # 過濾外資資料
             foreign_df = df[df['name'] == '外資及陸資(不含外資自營商)'].copy()
-            if foreign_df.empty:
-                return pd.DataFrame(), {}
+            if foreign_df.empty: return pd.DataFrame(), {}
 
             foreign_df['Date'] = pd.to_datetime(foreign_df['date'])
-            
-            # 計算淨買賣超 (單位轉為億元)
             foreign_df['Foreign_Net'] = (foreign_df['buy'] - foreign_df['sell']) / 100000000
             
-            # 整理三大法人供面板顯示用 (取最新一日)
             latest_date = df['date'].max()
             latest_df = df[df['date'] == latest_date]
             
-            # 【防呆函數】安全取得加總數值，避免 list index out of range
             def get_net_buy(name_filter):
                 sub_df = latest_df[latest_df['name'] == name_filter]
                 if sub_df.empty: return 0.0
@@ -100,30 +92,18 @@ def fetch_finmind_historical():
             return foreign_df[['Foreign_Net']], latest_inst
             
     except Exception as e:
-        st.error(f"FinMind API 串接發生例外錯誤: {e}")
+        st.warning(f"FinMind API 發生例外錯誤: {e}")
         
     return pd.DataFrame(), {}
 
 # ==========================================
 # 2. 策略引擎與多空打分
 # ==========================================
-def calculate_signals(mkt_df, foreign_df):
-    # 再次防呆：避免 DataFrame 空值導致後續報錯
-    if mkt_df.empty or foreign_df.empty:
-        return mkt_df, 0, 0
-
-    # 將價格與外資籌碼依照日期對齊
-    data = mkt_df.join(foreign_df, how='outer').ffill().dropna()
-    
-    if data.empty:
-        return data, 0, 0
-    
-    # 計算技術指標
+def calculate_signals(data):
     data['MA60'] = data['TWII'].rolling(60).mean()
     data['SOX_MA20'] = data['SOX'].rolling(20).mean()
     data['TSMC_MA20'] = data['TSMC'].rolling(20).mean()
     
-    # 計算籌碼 Z-score
     data['Foreign_120MA'] = data['Foreign_Net'].rolling(120, min_periods=10).mean()
     data['Foreign_120STD'] = data['Foreign_Net'].rolling(120, min_periods=10).std().replace(0, np.nan)
     data['Foreign_Zscore'] = (data['Foreign_Net'] - data['Foreign_120MA']) / data['Foreign_120STD']
@@ -143,7 +123,7 @@ def calculate_signals(mkt_df, foreign_df):
     if latest['TSMC'] > latest['TSMC_MA20']: long_score += 0.8
     elif latest['TSMC'] < latest['TSMC_MA20']: short_score += 0.5
         
-    if pd.notna(latest['Foreign_Zscore']):
+    if pd.notna(latest['Foreign_Zscore']) and latest['Foreign_120STD'] != 0:
         if latest['Foreign_Zscore'] > 1.5: long_score += 1.5
         elif latest['Foreign_Zscore'] < -1.5: short_score += 1.5
         
@@ -153,7 +133,7 @@ def calculate_signals(mkt_df, foreign_df):
 # 3. 視覺化儀表板
 # ==========================================
 def main():
-    st.title("📈 台指多因子量化戰情室 (完整籌碼 Z-score 版)")
+    st.title("📈 台指多因子量化戰情室 (強韌容錯版)")
     
     col_btn, col_time = st.columns([1, 4])
     with col_btn:
@@ -163,15 +143,25 @@ def main():
     with col_time:
         st.write(f"系統最後更新時間: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
 
-    with st.spinner('正在從 Yahoo 與 FinMind 獲取長天期歷史數據...'):
+    with st.spinner('正在獲取市場數據...'):
         mkt_df = fetch_market_data()
         foreign_df, latest_inst = fetch_finmind_historical()
         
-        if mkt_df.empty or foreign_df.empty:
-            st.error("資料載入失敗，請檢查網路或 API 狀態！")
+        # --- 容錯機制啟動 ---
+        if mkt_df.empty:
+            st.error("🚨 Yahoo Finance 價格數據嚴重載入失敗，無法執行運算。")
             return
             
-        data, long_score, short_score = calculate_signals(mkt_df, foreign_df)
+        if foreign_df.empty:
+            st.error("⚠️ 無法取得 FinMind 籌碼數據。已啟用降級模式，本次運算將不計入外資籌碼 Z-score 因子。")
+            # 產生假的 0 籌碼資料，讓系統繼續算大盤價格因子
+            foreign_df = pd.DataFrame(index=mkt_df.index)
+            foreign_df['Foreign_Net'] = 0.0
+            latest_inst = {'date': 'API 阻擋/斷線', '外資': 0, '投信': 0, '自營商': 0}
+            
+        # 價格與籌碼依照日期對齊
+        data = mkt_df.join(foreign_df, how='outer').ffill().dropna()
+        data, long_score, short_score = calculate_signals(data)
         
     st.header("一、 三大法人買賣超動向")
     st.caption(f"資料日期: {latest_inst.get('date', '未知')}")
@@ -183,11 +173,10 @@ def main():
     c2.metric("投信 (億)", f"{latest_inst.get('投信', 0):.2f}")
     c3.metric("自營商 (億)", f"{latest_inst.get('自營商', 0):.2f}")
     
-    # 取得最新 Z-score 並防呆
-    z_score_val = data['Foreign_Zscore'].iloc[-1] if not data.empty and 'Foreign_Zscore' in data else 0.0
+    z_score_val = data['Foreign_Zscore'].iloc[-1] if not data.empty and 'Foreign_Zscore' in data and not pd.isna(data['Foreign_Zscore'].iloc[-1]) else 0.0
     z_color = "normal" if z_score_val > 1.5 else ("inverse" if z_score_val < -1.5 else "off")
     c4.metric("📊 外資動能 Z-Score", f"{z_score_val:.2f}", 
-              "突破 1.5 觸發多方" if z_score_val > 1.5 else ("跌破 -1.5 觸發空方" if z_score_val < -1.5 else "常態區間"),
+              "突破 1.5" if z_score_val > 1.5 else ("跌破 -1.5" if z_score_val < -1.5 else "常態區間"),
               delta_color=z_color)
 
     st.header("二、 多空因子共振得分")
@@ -201,7 +190,7 @@ def main():
     m1.metric("多頭總分", f"{long_score:.1f}", delta="進場門檻: 4.0", delta_color="normal")
     
     bias = 0.0
-    if not pd.isna(data['MA60'].iloc[-1]) and data['MA60'].iloc[-1] != 0:
+    if not data.empty and not pd.isna(data['MA60'].iloc[-1]) and data['MA60'].iloc[-1] != 0:
         bias = ((data['TWII'].iloc[-1] / data['MA60'].iloc[-1]) - 1) * 100
         
     m2.metric("最新加權指數", f"{data['TWII'].iloc[-1]:.2f}", f"季線乖離: {bias:.2f}%")
@@ -213,13 +202,16 @@ def main():
     
     fig = make_subplots(rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.08, row_heights=[0.5, 0.25, 0.25])
     
-    fig.add_trace(go.Scatter(x=data.index, y=data['TWII'], name="加權指數", line=dict(color='silver', width=2)), row=1, col=1)
-    fig.add_trace(go.Scatter(x=data.index, y=data['MA60'], name="季線 (60MA)", line=dict(color='orange', width=2, dash='dot')), row=1, col=1)
+    if 'TWII' in data.columns and 'MA60' in data.columns:
+        fig.add_trace(go.Scatter(x=data.index, y=data['TWII'], name="加權指數", line=dict(color='silver', width=2)), row=1, col=1)
+        fig.add_trace(go.Scatter(x=data.index, y=data['MA60'], name="季線 (60MA)", line=dict(color='orange', width=2, dash='dot')), row=1, col=1)
     
-    fig.add_trace(go.Scatter(x=data.index, y=data['SOX'], name="費城半導體", line=dict(color='cyan', width=1.5)), row=2, col=1)
+    if 'SOX' in data.columns:
+        fig.add_trace(go.Scatter(x=data.index, y=data['SOX'], name="費城半導體", line=dict(color='cyan', width=1.5)), row=2, col=1)
     
-    colors = ['#ef4444' if val > 0 else '#22c55e' for val in data['Foreign_Net']]
-    fig.add_trace(go.Bar(x=data.index, y=data['Foreign_Net'], name="外資淨買賣(億)", marker_color=colors), row=3, col=1)
+    if 'Foreign_Net' in data.columns:
+        colors = ['#ef4444' if val > 0 else '#22c55e' for val in data['Foreign_Net']]
+        fig.add_trace(go.Bar(x=data.index, y=data['Foreign_Net'], name="外資淨買賣(億)", marker_color=colors), row=3, col=1)
     
     fig.update_layout(height=800, margin=dict(l=0, r=0, t=30, b=0), hovermode="x unified", 
                       legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
