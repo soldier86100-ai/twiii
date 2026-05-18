@@ -7,13 +7,14 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from datetime import datetime, timedelta
 
-st.set_page_config(layout="wide", page_title="台指多因子戰情室 (強韌容錯版)")
+st.set_page_config(layout="wide", page_title="台指多因子戰情室 (完整籌碼版)")
 
 # ==========================================
 # 1. 資料獲取模組 (Yahoo Finance + FinMind)
 # ==========================================
 @st.cache_data(ttl=3600)
 def fetch_market_data():
+    """使用 yfinance 抓取價格歷史資料"""
     end_date = datetime.now()
     start_date = end_date - timedelta(days=250)
     
@@ -25,14 +26,17 @@ def fetch_market_data():
             df = yf.download(ticker, start=start_date, end=end_date, progress=False)
             if df.empty: continue
 
+            # 清除時區避免合併報錯
             if df.index.tz is not None:
                 df.index = df.index.tz_localize(None)
             
+            # yfinance 新版 MultiIndex 防呆
             if isinstance(df.columns, pd.MultiIndex):
                 close_series = df['Close'][ticker].rename(name)
             else:
                 close_series = df['Close'].rename(name)
             
+            # 日期對齊 Outer Join
             if mkt_df.empty:
                 mkt_df = pd.DataFrame(close_series)
             else:
@@ -45,21 +49,25 @@ def fetch_market_data():
 
 @st.cache_data(ttl=3600)
 def fetch_finmind_historical():
+    """使用 FinMind API 抓取大盤三大法人歷史資料 (帶有 Token 授權)"""
     url = "https://api.finmindtrade.com/api/v4/data"
     start_date = (datetime.now() - timedelta(days=250)).strftime("%Y-%m-%d")
     
+    # 填入您的專屬 API Token
+    FINMIND_TOKEN = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJ1c2VyX2lkIjoia3VvODYwMSIsImVtYWlsIjoic29sZGllcjg2MTAwQGdtYWlsLmNvbSIsInRva2VuX3ZlcnNpb24iOjB9._5JgdrkR3h3ogK7zaxW1t7R4UxB0rbR-_aZUm3z0HLQ"
+    
     params = {
         "dataset": "TaiwanStockTotalInstitutionalInvestors",
-        "start_date": start_date
+        "start_date": start_date,
+        "token": FINMIND_TOKEN
     }
     
     try:
         res = requests.get(url, params=params, timeout=10)
         data = res.json()
         
-        # 檢查是否被 FinMind 限制流量
         if data.get('msg') != 'success':
-            st.warning(f"FinMind API 警告: {data.get('msg', '未知錯誤')} (可能達免費呼叫上限)")
+            st.warning(f"FinMind API 警告: {data.get('msg', '未知錯誤')}")
             return pd.DataFrame(), {}
             
         if len(data.get('data', [])) > 0:
@@ -143,23 +151,20 @@ def main():
     with col_time:
         st.write(f"系統最後更新時間: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
 
-    with st.spinner('正在獲取市場數據...'):
+    with st.spinner('正在獲取市場與籌碼數據...'):
         mkt_df = fetch_market_data()
         foreign_df, latest_inst = fetch_finmind_historical()
         
-        # --- 容錯機制啟動 ---
         if mkt_df.empty:
             st.error("🚨 Yahoo Finance 價格數據嚴重載入失敗，無法執行運算。")
             return
             
         if foreign_df.empty:
             st.error("⚠️ 無法取得 FinMind 籌碼數據。已啟用降級模式，本次運算將不計入外資籌碼 Z-score 因子。")
-            # 產生假的 0 籌碼資料，讓系統繼續算大盤價格因子
             foreign_df = pd.DataFrame(index=mkt_df.index)
             foreign_df['Foreign_Net'] = 0.0
-            latest_inst = {'date': 'API 阻擋/斷線', '外資': 0, '投信': 0, '自營商': 0}
+            latest_inst = {'date': '資料異常', '外資': 0, '投信': 0, '自營商': 0}
             
-        # 價格與籌碼依照日期對齊
         data = mkt_df.join(foreign_df, how='outer').ffill().dropna()
         data, long_score, short_score = calculate_signals(data)
         
