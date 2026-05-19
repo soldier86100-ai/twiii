@@ -17,7 +17,7 @@ def fetch_all_data():
     end_date = datetime.now()
     start_date = end_date - timedelta(days=250)
     
-    # 1. 抓取 Yahoo Finance 價格與成交量
+    # 1. 抓取 Yahoo Finance 價格與成交量 (改用 Ticker history 寫法提升穩定性)
     tickers = {
         'TWII': '^TWII', 'SOX': '^SOX', 'TSMC': '2330.TW',
         'TSM_ADR': 'TSM', 'ELEC': '0053.TW', 'FIN': '0055.TW'
@@ -26,20 +26,31 @@ def fetch_all_data():
     mkt_df = pd.DataFrame()
     for name, ticker in tickers.items():
         try:
-            df = yf.download(ticker, start=start_date, end=end_date, progress=False)
-            if df.empty: continue
-            if df.index.tz is not None: df.index = df.index.tz_localize(None)
+            tk = yf.Ticker(ticker)
+            df = tk.history(start=start_date, end=end_date)
             
-            if isinstance(df.columns, pd.MultiIndex):
-                close_series = df['Close'][ticker].rename(name)
-                if name == 'TSMC': vol_series = df['Volume'][ticker].rename('TSMC_Vol')
+            if df.empty: 
+                continue
+                
+            # 清除時區資訊以便後續對齊合併
+            if df.index.tz is not None: 
+                df.index = df.index.tz_localize(None)
+            
+            # 取出收盤價並重新命名
+            close_series = df['Close'].rename(name)
+            
+            if mkt_df.empty:
+                mkt_df = pd.DataFrame(close_series)
             else:
-                close_series = df['Close'].rename(name)
-                if name == 'TSMC': vol_series = df['Volume'].rename('TSMC_Vol')
-            
-            mkt_df = pd.DataFrame(close_series) if mkt_df.empty else mkt_df.join(close_series, how='outer')
-            if name == 'TSMC': mkt_df = mkt_df.join(vol_series, how='outer')
-        except Exception:
+                mkt_df = mkt_df.join(close_series, how='outer')
+                
+            # 如果是台積電，額外抓取成交量
+            if name == 'TSMC': 
+                vol_series = df['Volume'].rename('TSMC_Vol')
+                mkt_df = mkt_df.join(vol_series, how='outer')
+                
+        except Exception as e:
+            # 單一標的抓取失敗先略過，交由後續防呆機制處理
             pass
 
     # 2. 抓取 FinMind 籌碼
@@ -190,9 +201,23 @@ def main():
 
     with st.spinner('正在計算 V11 因子與生成圖表...'):
         data, has_foreign = fetch_all_data()
+        
+        # --- 🛡️ 新增防呆檢查：避免 KeyError ---
         if data.empty:
-            st.error("市場資料載入失敗！")
+            st.error("❌ 市場資料完全載入失敗！請檢查伺服器網路連線。")
             return
+            
+        # 檢查必備的 Yahoo 欄位是否都有成功抓到
+        required_cols = ['TWII', 'SOX', 'TSMC', 'TSMC_Vol', 'ELEC', 'FIN', 'TSM_ADR']
+        missing_cols = [col for col in required_cols if col not in data.columns]
+        
+        if missing_cols:
+            st.error(f"❌ Yahoo Finance 暫時連線失敗，缺少以下資料：{', '.join(missing_cols)}")
+            st.warning("💡 解決建議：請點擊左上角「🔄 重新同步數據」。(這通常是因為 Yahoo 暫時阻擋了伺服器 IP)")
+            return
+        # --------------------------------------
+
+        # 確認資料齊全後，才進入計算
         data, gate_long, gate_short, long_score, short_score = calculate_v11_signals(data, has_foreign)
 
     # ------------------------------------------
@@ -255,7 +280,7 @@ def main():
         st.plotly_chart(fig2, use_container_width=True)
 
     with colB:
-        # 4. 電金比，電金比月線與季線
+        # 3. 電金比，電金比月線與季線
         st.subheader("3. 資金輪動：電金比 (大環境門票3)")
         fig4 = go.Figure()
         fig4.add_trace(go.Scatter(x=data.index, y=data['電金比'], name="電金比", line=dict(color='magenta')))
@@ -264,7 +289,7 @@ def main():
         fig4.update_layout(height=350, margin=dict(t=10, b=10), hovermode="x unified")
         st.plotly_chart(fig4, use_container_width=True)
 
-    # 3. 台積電走勢 及台積電月線、台積電量能(爆量翻紅)
+    # 4. 台積電走勢 及台積電月線、台積電量能(爆量翻紅)
     st.subheader("4. 台積電價格與爆量偵測")
     fig3 = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.7, 0.3], vertical_spacing=0.05)
     fig3.add_trace(go.Scatter(x=data.index, y=data['TSMC'], name="台積電現貨", line=dict(color='red')), row=1, col=1)
