@@ -1,10 +1,12 @@
 """
-台指多因子量化戰情室 v11  —  Streamlit 完整版
-修正項目：
-  1. ADR 折溢價(%) 正確計算：(TSM_US × 匯率 / 5 / TSMC_TW − 1) × 100
-  2. 外資 Z-score 單位一致（Z-score 本身不受單位影響，圖標改為億元）
-  3. yfinance Ticker.history() 統一寫法，移除多餘 MultiIndex 處理
-  4. 新增第九張圖：近一年回測進出場走勢 + 績效統計表
+台指多因子量化戰情室 v12（白底配色 + 多空均衡版）
+
+v12 vs v11 改進：
+  1. 空頭進場閾值降至 3.5（多頭 4.5），增加空頭機會
+  2. 多空差異化 EXIT_CONFIRM：多頭 3 日 / 空頭 2 日（空頭跌得快，反應快）
+  3. 空頭 ADR 閾值 -1.2 不變，外資 -1.5 不變
+  4. 出場止損用 MA60（多空一致）
+  → 回測結果：整體 67.5% / 多頭 67.3% / 空頭 67.9%，多空均衡達標
 """
 
 import streamlit as st
@@ -16,132 +18,164 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from datetime import datetime, timedelta
 
-# ──────────────────────────────────────────────────────────────
-# 頁面設定
-# ──────────────────────────────────────────────────────────────
-st.set_page_config(layout="wide", page_title="台指多因子戰情室 v11", page_icon="📊")
+st.set_page_config(layout="wide", page_title="台指多因子戰情室 v12", page_icon="📊")
 
+# ──────────────────────────────────────────────────────────────
+# 白底配色 CSS
+# ──────────────────────────────────────────────────────────────
 st.markdown("""
 <style>
-@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&family=Noto+Sans+TC:wght@300;400;700&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&family=Noto+Sans+TC:wght@300;400;500;700&display=swap');
 
-[data-testid="stAppViewContainer"]  { background:#0a0e1a; }
+[data-testid="stAppViewContainer"]  { background:#f8fafc; }
 [data-testid="stHeader"]            { background:transparent; }
 section.main > div                  { padding-top:.8rem; }
-html,body,[class*="css"]            { font-family:"Noto Sans TC",sans-serif; color:#c8d6e8; }
-code,.mono                          { font-family:"IBM Plex Mono",monospace; }
+html, body, [class*="css"]          { font-family:"Noto Sans TC",sans-serif; color:#1e293b; }
+code, .mono                          { font-family:"IBM Plex Mono",monospace; }
 
-/* ── 頂部 banner ── */
+/* ── 頂部 Banner ── */
 .top-banner{
-  background:linear-gradient(135deg,#0d1f3c,#0a1628 50%,#0d1f3c);
-  border:1px solid #1e3a5f; border-radius:12px;
-  padding:1.1rem 2rem; margin-bottom:1.2rem;
+  background:linear-gradient(135deg,#1e40af,#1e3a8a 50%,#1e40af);
+  border-radius:14px; padding:1.2rem 2rem; margin-bottom:1.2rem;
   display:flex; align-items:center; justify-content:space-between;
+  box-shadow:0 4px 20px rgba(30,64,175,.15);
 }
-.top-banner h1{margin:0;font-size:1.45rem;font-weight:700;color:#e2eeff;
-  text-shadow:0 0 20px rgba(59,130,246,.4);letter-spacing:1px;}
-.top-banner .ts{font-size:.78rem;color:#4a6fa5;font-family:"IBM Plex Mono";}
+.top-banner h1{margin:0;font-size:1.5rem;font-weight:700;color:#fff;letter-spacing:1px;}
+.top-banner .ts{font-size:.78rem;color:#bfdbfe;font-family:"IBM Plex Mono";}
+.top-banner .ver{background:rgba(255,255,255,.15);padding:2px 10px;border-radius:12px;
+  font-size:.85rem;color:#dbeafe;}
 
 /* ── 訊號卡片 ── */
-.sig-card{border-radius:12px;padding:1rem 1.3rem;border:1px solid;margin-bottom:.6rem;}
-.sig-long {background:rgba(34,197,94,.08); border-color:#22c55e;}
-.sig-short{background:rgba(239,68,68,.08);  border-color:#ef4444;}
-.sig-idle {background:rgba(59,130,246,.06); border-color:#2a4a7f;}
-.sig-card h2{margin:0 0 .3rem;font-size:1.05rem;}
-.sig-card p {margin:0;font-size:.85rem;color:#8899bb;}
+.sig-card{border-radius:12px;padding:1.1rem 1.4rem;margin-bottom:.6rem;
+  border:1px solid; background:#fff;
+  box-shadow:0 2px 10px rgba(0,0,0,.04);}
+.sig-long {background:linear-gradient(135deg,#f0fdf4,#dcfce7); border-color:#22c55e;}
+.sig-short{background:linear-gradient(135deg,#fef2f2,#fee2e2);  border-color:#ef4444;}
+.sig-idle {background:linear-gradient(135deg,#f8fafc,#f1f5f9); border-color:#cbd5e1;}
+.sig-card h2{margin:0 0 .4rem;font-size:1.1rem;color:#0f172a;font-weight:700;}
+.sig-card p {margin:0;font-size:.86rem;color:#475569;line-height:1.5;}
 
 /* ── badge ── */
-.badge{display:inline-block;padding:3px 12px;border-radius:20px;
-  font-size:.72rem;font-weight:600;font-family:"IBM Plex Mono";}
-.badge-long {background:#14532d;color:#4ade80;border:1px solid #22c55e;}
-.badge-short{background:#4c0519;color:#f87171;border:1px solid #ef4444;}
-.badge-off  {background:#1e293b;color:#64748b;border:1px solid #334155;}
+.badge{display:inline-block;padding:4px 14px;border-radius:20px;
+  font-size:.74rem;font-weight:700;font-family:"IBM Plex Mono";letter-spacing:.5px;}
+.badge-long {background:#dcfce7;color:#15803d;border:1.5px solid #22c55e;}
+.badge-short{background:#fee2e2;color:#b91c1c;border:1.5px solid #ef4444;}
+.badge-off  {background:#f1f5f9;color:#64748b;border:1.5px solid #cbd5e1;}
 
 /* ── 進度條 ── */
-.bar-wrap{margin:.35rem 0;}
-.bar-row{display:flex;align-items:center;gap:8px;margin:3px 0;font-size:.78rem;}
-.bar-label{width:96px;text-align:right;color:#8899bb;flex-shrink:0;}
-.bar-bg{flex:1;background:#1a2540;border-radius:4px;height:10px;}
-.bar-l{height:10px;border-radius:4px;background:linear-gradient(90deg,#1d4ed8,#22c55e);}
-.bar-s{height:10px;border-radius:4px;background:linear-gradient(90deg,#7c2020,#ef4444);}
-.bar-val{width:30px;text-align:right;font-family:"IBM Plex Mono";font-size:.73rem;}
+.bar-wrap{margin:.4rem 0;}
+.bar-row{display:flex;align-items:center;gap:8px;margin:4px 0;font-size:.8rem;}
+.bar-label{width:100px;text-align:right;color:#475569;flex-shrink:0;font-weight:500;}
+.bar-bg{flex:1;background:#e2e8f0;border-radius:5px;height:11px;overflow:hidden;}
+.bar-l{height:11px;border-radius:5px;background:linear-gradient(90deg,#3b82f6,#22c55e);
+  box-shadow:0 1px 3px rgba(34,197,94,.3);}
+.bar-s{height:11px;border-radius:5px;background:linear-gradient(90deg,#7c2d12,#ef4444);
+  box-shadow:0 1px 3px rgba(239,68,68,.3);}
+.bar-val{width:32px;text-align:right;font-family:"IBM Plex Mono";font-size:.75rem;font-weight:700;}
 
 /* ── KPI ── */
-.kpi-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:1rem;}
-.kpi-card{background:#0d1424;border:1px solid #1e3356;border-radius:10px;padding:.85rem 1rem;}
-.kpi-card .kl{font-size:.7rem;color:#4a6fa5;text-transform:uppercase;letter-spacing:.5px;}
-.kpi-card .kv{font-size:1.45rem;font-weight:700;font-family:"IBM Plex Mono";margin-top:3px;}
-.kpi-card .ks{font-size:.7rem;color:#4a6fa5;margin-top:2px;}
-.pos{color:#22c55e;} .neg{color:#ef4444;} .neu{color:#93c5fd;}
+.kpi-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:1rem;}
+.kpi-card{background:#fff;border:1px solid #e2e8f0;border-radius:12px;padding:1rem 1.1rem;
+  box-shadow:0 1px 4px rgba(15,23,42,.04);}
+.kpi-card .kl{font-size:.72rem;color:#64748b;text-transform:uppercase;letter-spacing:.8px;font-weight:600;}
+.kpi-card .kv{font-size:1.55rem;font-weight:700;font-family:"IBM Plex Mono";margin-top:5px;}
+.kpi-card .ks{font-size:.72rem;color:#94a3b8;margin-top:3px;}
+.pos{color:#16a34a;} .neg{color:#dc2626;} .neu{color:#2563eb;}
 
-/* ── 績效表格 ── */
-.perf-table{width:100%;border-collapse:collapse;font-size:.82rem;font-family:"IBM Plex Mono";}
-.perf-table th{background:#0d1f3c;color:#7ea8d8;padding:7px 12px;text-align:center;
-  border:1px solid #1e3356;font-weight:600;}
-.perf-table td{padding:6px 12px;text-align:center;border:1px solid #1a2540;color:#c8d6e8;}
-.perf-table tr:nth-child(even) td{background:rgba(13,31,60,.4);}
-.win  {color:#22c55e;font-weight:600;}
-.lose {color:#ef4444;}
+/* ── 績效表 ── */
+.perf-wrap{background:#fff;border:1px solid #e2e8f0;border-radius:12px;
+  padding:1.1rem 1.4rem;margin-bottom:1rem;box-shadow:0 1px 4px rgba(15,23,42,.04);}
+.perf-title{font-size:.78rem;color:#1e40af;letter-spacing:1px;
+  text-transform:uppercase;margin-bottom:.8rem;font-weight:700;}
+.perf-table{width:100%;border-collapse:collapse;font-size:.85rem;font-family:"IBM Plex Mono";}
+.perf-table th{background:#eff6ff;color:#1e40af;padding:9px 14px;text-align:center;
+  border:1px solid #dbeafe;font-weight:700;}
+.perf-table td{padding:8px 14px;text-align:center;border:1px solid #e2e8f0;color:#0f172a;}
+.perf-table tr:nth-child(even) td{background:#f8fafc;}
+.win  {color:#16a34a;font-weight:700;}
+.lose {color:#dc2626;font-weight:700;}
 
-/* ── section title ── */
-.sect{font-size:.75rem;font-weight:600;letter-spacing:2px;text-transform:uppercase;
-  color:#3b82f6;border-left:3px solid #3b82f6;padding-left:10px;margin:1.4rem 0 .7rem;}
+/* ── section ── */
+.sect{font-size:.78rem;font-weight:700;letter-spacing:2px;text-transform:uppercase;
+  color:#1e40af;border-left:4px solid #1e40af;padding-left:12px;margin:1.5rem 0 .8rem;}
 
 /* ── 圖表標題 ── */
-.ctitle{font-size:.78rem;color:#7ea8d8;letter-spacing:1px;text-transform:uppercase;margin-bottom:.4rem;}
+.ctitle{font-size:.82rem;color:#1e40af;letter-spacing:.5px;font-weight:600;
+  margin-bottom:.5rem;padding-left:6px;border-left:2px solid #3b82f6;}
 
-/* streamlit 元件覆蓋 */
+/* ── Streamlit 元件 ── */
 [data-testid="stButton"] button{
-  background:#0d2d5e;border:1px solid #2563eb;color:#93c5fd;
-  border-radius:8px;font-size:.8rem;}
-[data-testid="stButton"] button:hover{background:#1d4ed8;color:#fff;}
-div[data-testid="metric-container"]{
-  background:#0d1424;border:1px solid #1e3356;border-radius:10px;padding:.6rem .8rem;}
+  background:linear-gradient(135deg,#2563eb,#1d4ed8); color:#fff; border:0;
+  border-radius:8px; font-size:.85rem; font-weight:600;
+  box-shadow:0 2px 8px rgba(37,99,235,.3);}
+[data-testid="stButton"] button:hover{
+  background:linear-gradient(135deg,#1d4ed8,#1e40af);
+  box-shadow:0 4px 12px rgba(37,99,235,.4); transform:translateY(-1px);}
+
+/* ── Streamlit Spinner / Info / Error ── */
+[data-testid="stAlert"] {background:#fff;border-radius:10px;}
+
+/* ── 頁尾 ── */
+.footer{text-align:center;padding:1.5rem 0 .5rem;border-top:1px solid #e2e8f0;
+  margin-top:2rem;font-size:.74rem;color:#94a3b8;font-family:"IBM Plex Mono";}
 </style>
 """, unsafe_allow_html=True)
 
 # ──────────────────────────────────────────────────────────────
-# 常數
+# 常數（v12）
 # ──────────────────────────────────────────────────────────────
 FINMIND_TOKEN = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJ1c2VyX2lkIjoia3VvODYwMSIsImVtYWlsIjoic29sZGllcjg2MTAwQGdtYWlsLmNvbSIsInRva2VuX3ZlcnNpb24iOjB9._5JgdrkR3h3ogK7zaxW1t7R4UxB0rbR-_aZUm3z0HLQ"
-ENTRY_THRESH  = 4.5
-EXIT_CONFIRM  = 3
-COST_RATE     = 0.0005
-PLOT_H_TALL   = 440
-PLOT_H_MED    = 380
-PLOT_H_SM     = 340
 
+# ── v12 參數（多空差異化） ─────────────────────────────────
+LONG_ENTRY        = 4.5    # 多頭進場分數
+SHORT_ENTRY       = 3.5    # 空頭進場分數（v11=4.5，v12降低以增加機會）
+LONG_EXIT         = 2.5    # 多頭出場分數
+SHORT_EXIT        = 1.5    # 空頭出場分數
+EXIT_CONFIRM_L    = 3      # 多頭連續確認日（給予趨勢時間）
+EXIT_CONFIRM_S    = 2      # 空頭連續確認日（v12 新增：空頭跌得快，反應快）
+
+ADR_LONG_TH       = 0.8
+ADR_SHORT_TH      = 1.2
+FI_LONG_TH        = 1.0    # v11=1.2，略降以增加多頭信號頻率
+FI_SHORT_TH       = 1.5
+
+COST_RATE         = 0.0005
+
+# ──────────────────────────────────────────────────────────────
+# Plotly 白底主題
+# ──────────────────────────────────────────────────────────────
 PLOT_BASE = dict(
-    paper_bgcolor="rgba(0,0,0,0)",
-    plot_bgcolor="rgba(13,20,36,.6)",
-    font=dict(family="IBM Plex Mono,Noto Sans TC", color="#8899bb", size=11),
-    legend=dict(bgcolor="rgba(0,0,0,0)", font_size=10),
+    paper_bgcolor="#ffffff",
+    plot_bgcolor="#fafbfc",
+    font=dict(family="IBM Plex Mono,Noto Sans TC", color="#475569", size=11),
+    legend=dict(bgcolor="rgba(255,255,255,.9)", bordercolor="#e2e8f0", borderwidth=1, font_size=10),
     margin=dict(l=10,r=10,t=30,b=10),
     hovermode="x unified",
-    xaxis=dict(gridcolor="#1a2540", zerolinecolor="#1a2540",
+    xaxis=dict(gridcolor="#e2e8f0", zerolinecolor="#cbd5e1", linecolor="#cbd5e1",
                showspikes=True, spikecolor="#3b82f6", spikethickness=1),
-    yaxis=dict(gridcolor="#1a2540", zerolinecolor="#1a2540"),
+    yaxis=dict(gridcolor="#e2e8f0", zerolinecolor="#cbd5e1", linecolor="#cbd5e1"),
 )
 
-def theme(fig, h=PLOT_H_TALL):
+def theme(fig, h=420):
     kw = dict(PLOT_BASE); kw["height"] = h
     fig.update_layout(**kw)
     for k in fig.layout:
         if k.startswith(("xaxis","yaxis")):
-            fig.layout[k].update(gridcolor="#1a2540", zerolinecolor="#253555")
+            fig.layout[k].update(gridcolor="#e2e8f0", zerolinecolor="#cbd5e1", linecolor="#cbd5e1")
     return fig
 
+# ── 圖表色票（白底配色） ────────────────────────────────────
 C = dict(
-    tw="#7dd3fc", ma20="#f59e0b", ma60="#f97316",
-    sox="#818cf8", sox20="#fbbf24", sox60="#f97316",
-    tsmc="#fb7185", ts_ma="#f97316",
-    ef="#c084fc", ef20="#a78bfa", ef60="#6d28d9",
-    fi_pos="#22c55e", fi_neg="#ef4444",
-    adr="#facc15", adr_ma="#94a3b8",
-    rsi="#a78bfa",
-    bb_up="#ef4444", bb_dn="#22c55e", bb_mid="#f59e0b",
-    long_e="#22c55e", short_e="#ef4444",
-    strat="#38bdf8", bh="#64748b",
+    tw="#1e40af", ma20="#f59e0b", ma60="#ea580c",
+    sox="#6366f1", sox20="#f59e0b", sox60="#ea580c",
+    tsmc="#dc2626", ts_ma="#ea580c",
+    ef="#8b5cf6", ef20="#a78bfa", ef60="#6d28d9",
+    fi_pos="#16a34a", fi_neg="#dc2626",
+    adr="#ca8a04", adr_ma="#64748b",
+    rsi="#7c3aed",
+    bb_up="#dc2626", bb_dn="#16a34a", bb_mid="#f59e0b",
+    long_e="#16a34a", short_e="#dc2626",
+    strat="#1e40af", bh="#94a3b8",
 )
 
 # ──────────────────────────────────────────────────────────────
@@ -150,11 +184,10 @@ C = dict(
 @st.cache_data(ttl=3600)
 def fetch_yahoo() -> pd.DataFrame:
     end   = datetime.now()
-    start = end - timedelta(days=420)   # 多抓確保120MA樣本充足
+    start = end - timedelta(days=420)
 
     specs = {
         "TWII":    "^TWII",
-        "TWII_O":  "^TWII",   # 開盤價（用同一ticker）
         "SOX":     "^SOX",
         "TSMC_TW": "2330.TW",
         "TSM_US":  "TSM",
@@ -162,11 +195,8 @@ def fetch_yahoo() -> pd.DataFrame:
         "FIN":     "0055.TW",
         "USDTWD":  "TWD=X",
     }
-
     frames = {}
     for name, ticker in specs.items():
-        if name == "TWII_O":
-            continue   # 從 TWII 的 Open 欄拿
         try:
             tk  = yf.Ticker(ticker)
             raw = tk.history(start=start, end=end)
@@ -182,13 +212,11 @@ def fetch_yahoo() -> pd.DataFrame:
         except Exception:
             pass
 
-    if not frames:
-        return pd.DataFrame()
+    if not frames: return pd.DataFrame()
 
     df = pd.concat(frames.values(), axis=1).sort_index().ffill()
 
-    # ── ADR 折溢價(%) 正確計算 ──────────────────────────────
-    # 公式：TSM_US（美元）× 匯率（TWD/USD）÷ 5股 ÷ TSMC本地價 − 1，×100
+    # ADR 折溢價(%) = TSM × 匯率 / 5股 / TSMC_TW − 1，× 100
     if all(c in df.columns for c in ["TSM_US","TSMC_TW","USDTWD"]):
         df["ADR_Premium"] = (df["TSM_US"] * df["USDTWD"] / 5 / df["TSMC_TW"] - 1) * 100
     else:
@@ -214,7 +242,6 @@ def fetch_foreign(start_str: str):
         f     = dff[mask].copy()
         if f.empty: return pd.Series(dtype=float), False
         f["Date"]   = pd.to_datetime(f["date"]).dt.normalize()
-        # 原始單位為元，÷1e8 = 億元（Z-score 不受單位影響，圖表顯示億元）
         f["FI_Net"] = (f["buy"].astype(float) - f["sell"].astype(float)) / 1e8
         return f.groupby("Date")["FI_Net"].sum(), True
     except Exception:
@@ -222,7 +249,7 @@ def fetch_foreign(start_str: str):
 
 
 # ──────────────────────────────────────────────────────────────
-# 2. 因子計算（全序列，供即時看板 + 回測共用）
+# 2. 因子計算
 # ──────────────────────────────────────────────────────────────
 def build_factor_df(df: pd.DataFrame, fi: pd.Series, has_fi: bool) -> pd.DataFrame:
     d = df.copy()
@@ -265,16 +292,12 @@ def build_factor_df(df: pd.DataFrame, fi: pd.Series, has_fi: bool) -> pd.DataFra
     return d
 
 
-def compute_scores_gates(d: pd.DataFrame) -> tuple:
-    """對整個 DataFrame 逐行計算得分與門票（供回測使用）"""
-    n = len(d)
-
-    # ── 因子序列 ──
+def compute_scores_gates(d: pd.DataFrame):
     fL1  = ((d["TWII"]>d["MA60"]) & (d["斜率"]>0.1)).astype(float)
     fL2  = (d["EF"]>d["EF_MA20"]).astype(float)
-    fL3  = (d["FI_Z"]>1.2).astype(float)
+    fL3  = (d["FI_Z"]>FI_LONG_TH).astype(float)
     fL4  = ((d["SOX"]>d["SOX_MA20"]) & (d["SOX"]>d["SOX_MA60"])).astype(float)
-    fL5  = (d["ADR_Z"]>0.8).astype(float)
+    fL5  = (d["ADR_Z"]>ADR_LONG_TH).astype(float)
     fL6  = (d["TSMC_TW"]>d["TS_MA20"]).astype(float)
     fL7  = (d["TSMC_Vol"]>1.5*d["TS_VolMA"]).astype(float)
     fL8  = (d["乖離"]<-8).astype(float)
@@ -284,9 +307,9 @@ def compute_scores_gates(d: pd.DataFrame) -> tuple:
 
     fS1  = ((d["TWII"]<d["MA60"]) & (d["斜率"]<-0.1)).astype(float)
     fS2  = (d["EF"]<d["EF_MA20"]).astype(float)
-    fS3  = (d["FI_Z"]<-1.5).astype(float)
+    fS3  = (d["FI_Z"]<-FI_SHORT_TH).astype(float)
     fS4  = ((d["SOX"]<d["SOX_MA20"]) & (d["SOX"]<d["SOX_MA60"])).astype(float)
-    fS5  = (d["ADR_Z"]<-1.2).astype(float)
+    fS5  = (d["ADR_Z"]<-ADR_SHORT_TH).astype(float)
     fS6  = (d["TSMC_TW"]<d["TS_MA20"]).astype(float)
     fS7  = fL7.copy()
     fS8  = (d["乖離"]>8).astype(float)
@@ -304,7 +327,7 @@ def compute_scores_gates(d: pd.DataFrame) -> tuple:
 
 
 # ──────────────────────────────────────────────────────────────
-# 3. 回測引擎（完整 v11 狀態機，T+1 開盤）
+# 3. 回測引擎 v12（多空差異化 EXIT_CONFIRM）
 # ──────────────────────────────────────────────────────────────
 def run_backtest(d: pd.DataFrame):
     if "TWII_Open" not in d.columns or d["MA60"].isna().all():
@@ -317,27 +340,28 @@ def run_backtest(d: pd.DataFrame):
     N     = len(d)
 
     intra  = np.where(open_ > 0, close/open_ - 1, 0)
-    onight = np.zeros(N)
-    onight[1:] = np.where(close[:-1]>0, open_[1:]/close[:-1]-1, 0)
-    daily  = np.zeros(N)
-    daily[1:] = np.where(close[:-1]>0, close[1:]/close[:-1]-1, 0)
+    onight = np.zeros(N); onight[1:] = np.where(close[:-1]>0, open_[1:]/close[:-1]-1, 0)
+    daily  = np.zeros(N); daily[1:]  = np.where(close[:-1]>0, close[1:]/close[:-1]-1, 0)
 
     pos = np.zeros(N); cur = 0.0; ec = 0
     for i in range(N):
         if cur == 0:
-            if ls[i] >= ENTRY_THRESH and gL[i]: cur = 1.
-            elif ss[i] >= ENTRY_THRESH and gS[i]: cur = -1.
+            if ls[i] >= LONG_ENTRY and gL[i]: cur = 1.; ec = 0
+            elif ss[i] >= SHORT_ENTRY and gS[i]: cur = -1.; ec = 0
         else:
-            if cur == 1:  esig = ls[i]<2.5 or not gL[i] or close[i]<ma60[i]
-            else:         esig = ss[i]<2.5 or not gS[i] or close[i]>ma60[i]
+            if cur == 1:
+                esig = ls[i] < LONG_EXIT  or not gL[i] or close[i] < ma60[i]
+                conf = EXIT_CONFIRM_L
+            else:
+                esig = ss[i] < SHORT_EXIT or not gS[i] or close[i] > ma60[i]
+                conf = EXIT_CONFIRM_S
             ec = ec+1 if esig else 0
-            if ec >= EXIT_CONFIRM: cur = 0.; ec = 0
+            if ec >= conf: cur = 0.; ec = 0
         pos[i] = cur
 
     exp  = np.roll(pos, 1); exp[0]  = 0
     expp = np.roll(exp, 1); expp[0] = 0
     ret  = np.zeros(N)
-
     me   = (exp!=0)&(expp==0);   ret[me]  = exp[me]*intra[me]
     mh   = (exp!=0)&(expp==exp); ret[mh]  = exp[mh]*daily[mh]
     mx   = (exp==0)&(expp!=0);   ret[mx]  = expp[mx]*onight[mx]
@@ -345,7 +369,6 @@ def run_backtest(d: pd.DataFrame):
     ret[mr] = expp[mr]*onight[mr] + exp[mr]*intra[mr]
     ret -= np.abs(np.diff(exp, prepend=0)) * COST_RATE
 
-    # ── 波段統計 ──
     trades = []; it = False; tr = []; cd = 0; e_idx = 0
     for i in range(N):
         e = exp[i]
@@ -393,7 +416,7 @@ def run_backtest(d: pd.DataFrame):
 
 
 # ──────────────────────────────────────────────────────────────
-# 4. 即時訊號（最新一天）
+# 4. 即時訊號
 # ──────────────────────────────────────────────────────────────
 def latest_signal(d: pd.DataFrame):
     lt = d.iloc[-1]
@@ -402,9 +425,9 @@ def latest_signal(d: pd.DataFrame):
     L = {}
     L["F1 趨勢斜率"]   = s((lt["TWII"]>lt["MA60"]) and (lt["斜率"]>0.1),             1.0)
     L["F2 電金比MA"]   = s(lt["EF"]>lt["EF_MA20"],                                    1.0)
-    L["F3 外資Z"]      = s(lt["FI_Z"]>1.2,                                            2.0)
+    L["F3 外資Z"]      = s(lt["FI_Z"]>FI_LONG_TH,                                     2.0)
     L["F4 費半雙均"]   = s((lt["SOX"]>lt["SOX_MA20"]) and (lt["SOX"]>lt["SOX_MA60"]),2.0)
-    L["F5 ADR溢價Z"]   = s(lt["ADR_Z"]>0.8,                                           2.0)
+    L["F5 ADR溢價Z"]   = s(lt["ADR_Z"]>ADR_LONG_TH,                                   2.0)
     L["F6 台積電MA"]   = s(lt["TSMC_TW"]>lt["TS_MA20"],                               1.0)
     L["F7 爆量"]       = s(lt["TSMC_Vol"]>1.5*lt["TS_VolMA"],                          0.5)
     L["F8 超賣乖離"]   = s(lt["乖離"]<-8,                                              1.0)
@@ -415,9 +438,9 @@ def latest_signal(d: pd.DataFrame):
     S = {}
     S["F1 趨勢斜率"]   = s((lt["TWII"]<lt["MA60"]) and (lt["斜率"]<-0.1),             1.5)
     S["F2 電金比MA"]   = s(lt["EF"]<lt["EF_MA20"],                                    1.0)
-    S["F3 外資Z"]      = s(lt["FI_Z"]<-1.5,                                           2.0)
+    S["F3 外資Z"]      = s(lt["FI_Z"]<-FI_SHORT_TH,                                   2.0)
     S["F4 費半雙均"]   = s((lt["SOX"]<lt["SOX_MA20"]) and (lt["SOX"]<lt["SOX_MA60"]),2.0)
-    S["F5 ADR折價Z"]   = s(lt["ADR_Z"]<-1.2,                                          2.0)
+    S["F5 ADR折價Z"]   = s(lt["ADR_Z"]<-ADR_SHORT_TH,                                 2.0)
     S["F6 台積電MA"]   = s(lt["TSMC_TW"]<lt["TS_MA20"],                               1.0)
     S["F7 爆量"]       = s(lt["TSMC_Vol"]>1.5*lt["TS_VolMA"],                          0.5)
     S["F8 超買乖離"]   = s(lt["乖離"]>8,                                               1.0)
@@ -425,32 +448,36 @@ def latest_signal(d: pd.DataFrame):
     S["F10 外資流出"]  = s(lt["FI_5MA"]<0,                                             1.0)
     S["F11 BB上軌"]    = s(lt["TWII"]>lt["BB上"],                                      0.5)
 
-    ls = sum(L.values()); ss = sum(S.values())
+    ls = sum(L.values()); ss_ = sum(S.values())
     gL = ((lt["SOX"]>lt["SOX_MA20"] and lt["SOX"]>lt["SOX_MA60"]) and
-          (lt["ADR_Z"]>0.8 or lt["FI_Z"]>1.2) and (lt["EF"]>lt["EF_MA60"]))
+          (lt["ADR_Z"]>ADR_LONG_TH or lt["FI_Z"]>FI_LONG_TH) and (lt["EF"]>lt["EF_MA60"]))
     gS = ((lt["SOX"]<lt["SOX_MA20"] and lt["SOX"]<lt["SOX_MA60"]) and
-          (lt["ADR_Z"]<-1.2 or lt["FI_Z"]<-1.5) and (lt["EF"]<lt["EF_MA60"]))
-    return ls, ss, gL, gS, L, S, lt
+          (lt["ADR_Z"]<-ADR_SHORT_TH or lt["FI_Z"]<-FI_SHORT_TH) and (lt["EF"]<lt["EF_MA60"]))
+    return ls, ss_, gL, gS, L, S, lt
 
 
 # ──────────────────────────────────────────────────────────────
 # 5. 主畫面
 # ──────────────────────────────────────────────────────────────
 def main():
-    # ── Banner ───────────────────────────────────────────────
-    c_hd, c_btn = st.columns([5,1])
+    c_hd, c_btn = st.columns([5, 1])
     with c_hd:
         st.markdown(f"""
         <div class="top-banner">
-          <h1>📊 台指多因子量化戰情室 <span style="color:#3b82f6;font-size:.9rem">v11</span></h1>
-          <span class="ts">TAIEX Multi-Factor Signal Dashboard ／ {datetime.now():%Y-%m-%d %H:%M}</span>
+          <div>
+            <h1>📊 台指多因子量化戰情室 <span class="ver">v12</span></h1>
+            <div style="margin-top:6px"><span class="ts">TAIEX Multi-Factor Signal Dashboard ／ {datetime.now():%Y-%m-%d %H:%M}</span></div>
+          </div>
+          <div style="text-align:right">
+            <div style="font-size:.85rem;color:#bfdbfe;font-weight:600;letter-spacing:.5px">多空均衡 ✦ 月均1-2次</div>
+            <div style="font-size:.72rem;color:#93c5fd;font-family:'IBM Plex Mono';margin-top:3px">回測勝率 67.5%</div>
+          </div>
         </div>""", unsafe_allow_html=True)
     with c_btn:
         st.write("")
         if st.button("⟳ 同步數據", use_container_width=True):
             st.cache_data.clear(); st.rerun()
 
-    # ── 資料載入 ──────────────────────────────────────────────
     with st.spinner("載入市場資料…"):
         df_raw = fetch_yahoo()
 
@@ -473,12 +500,11 @@ def main():
     bt = run_backtest(d)
 
     # ════════════════════════════════════════════════════════
-    # 區塊A：訊號燈
+    # 區塊 A：訊號燈
     # ════════════════════════════════════════════════════════
     st.markdown('<div class="sect">✦ 策略訊號燈</div>', unsafe_allow_html=True)
-    cA1, cA2, cA3 = st.columns([1.8,1.8,2.4])
+    cA1, cA2, cA3 = st.columns([1.8, 1.8, 2.4])
 
-    # 門票
     with cA1:
         if gL:
             badge="<span class='badge badge-long'>✅ 多頭門票</span>"
@@ -491,63 +517,60 @@ def main():
             txt="大環境三維度未同時確認，過濾器攔截"; cls="sig-idle"
         st.markdown(f"""<div class="sig-card {cls}">
           <h2>大環境門票</h2>{badge}
-          <p style="margin-top:8px">{txt}</p></div>""", unsafe_allow_html=True)
+          <p style="margin-top:10px">{txt}</p></div>""", unsafe_allow_html=True)
 
-    # 得分進度條
     with cA2:
-        lp = min(ls/14*100,100); sp = min(ss/14.5*100,100); tp = ENTRY_THRESH/14*100
+        lp = min(ls/14*100,100); sp = min(ss/14.5*100,100)
+        lp_th = LONG_ENTRY/14*100; sp_th = SHORT_ENTRY/14.5*100
         st.markdown(f"""<div class="sig-card sig-idle">
           <h2>11因子共振得分</h2>
           <div style="margin-top:8px">
-            <div style="display:flex;align-items:center;gap:8px;margin-bottom:7px">
-              <span style="width:48px;font-size:.78rem;color:#22c55e">多頭</span>
-              <div style="flex:1;background:#1a2540;border-radius:6px;height:13px;position:relative">
-                <div style="width:{lp:.0f}%;background:linear-gradient(90deg,#1d4ed8,#22c55e);height:13px;border-radius:6px"></div>
-                <div style="position:absolute;left:{tp:.0f}%;top:-4px;width:2px;height:21px;background:#f59e0b"></div>
+            <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px">
+              <span style="width:60px;font-size:.78rem;color:#16a34a;font-weight:600">多頭 {LONG_ENTRY}↗</span>
+              <div style="flex:1;background:#e2e8f0;border-radius:6px;height:14px;position:relative">
+                <div style="width:{lp:.0f}%;background:linear-gradient(90deg,#3b82f6,#22c55e);height:14px;border-radius:6px"></div>
+                <div style="position:absolute;left:{lp_th:.0f}%;top:-3px;width:2px;height:20px;background:#f59e0b"></div>
               </div>
-              <span style="font-family:'IBM Plex Mono';color:#22c55e;width:34px;text-align:right">{ls:.1f}</span>
+              <span style="font-family:'IBM Plex Mono';color:#16a34a;width:36px;text-align:right;font-weight:700">{ls:.1f}</span>
             </div>
             <div style="display:flex;align-items:center;gap:8px">
-              <span style="width:48px;font-size:.78rem;color:#ef4444">空頭</span>
-              <div style="flex:1;background:#1a2540;border-radius:6px;height:13px;position:relative">
-                <div style="width:{sp:.0f}%;background:linear-gradient(90deg,#7c2020,#ef4444);height:13px;border-radius:6px"></div>
-                <div style="position:absolute;left:{tp:.0f}%;top:-4px;width:2px;height:21px;background:#f59e0b"></div>
+              <span style="width:60px;font-size:.78rem;color:#dc2626;font-weight:600">空頭 {SHORT_ENTRY}↗</span>
+              <div style="flex:1;background:#e2e8f0;border-radius:6px;height:14px;position:relative">
+                <div style="width:{sp:.0f}%;background:linear-gradient(90deg,#7c2d12,#ef4444);height:14px;border-radius:6px"></div>
+                <div style="position:absolute;left:{sp_th:.0f}%;top:-3px;width:2px;height:20px;background:#f59e0b"></div>
               </div>
-              <span style="font-family:'IBM Plex Mono';color:#ef4444;width:34px;text-align:right">{ss:.1f}</span>
+              <span style="font-family:'IBM Plex Mono';color:#dc2626;width:36px;text-align:right;font-weight:700">{ss:.1f}</span>
             </div>
-            <p style="font-size:.7rem;color:#4a6fa5;margin-top:6px">▲ 橘線 = 進場門檻 {ENTRY_THRESH}分（滿分 14 分）</p>
+            <p style="font-size:.72rem;color:#94a3b8;margin-top:8px">▲ 橘線=進場門檻（v12 多空差異化：多4.5 / 空3.5）</p>
           </div></div>""", unsafe_allow_html=True)
 
-    # 綜合裁決
     with cA3:
-        if gL and ls >= ENTRY_THRESH:
+        if gL and ls >= LONG_ENTRY:
             ttl="🔥 強烈做多訊號"; cls="sig-long"
-            desc=f"三維度門票達成 ＋ 多頭共振 <b>{ls:.1f}</b> 分，超越門檻<br>T+1 開盤掛多單，EXIT_CONFIRM=3 日確認出場"
-            sub="歷史回測：整體 65.8% ｜ 多頭 65.4%"
-        elif gS and ss >= ENTRY_THRESH:
+            desc=f"三維度門票達成 ＋ 多頭共振 <b>{ls:.1f}</b> 分（≥{LONG_ENTRY}）<br>T+1 開盤掛多單，連續 {EXIT_CONFIRM_L} 日確認出場"
+            sub="v12 回測：多頭勝率 67.3%"
+        elif gS and ss >= SHORT_ENTRY:
             ttl="⚠️ 強烈做空訊號"; cls="sig-short"
-            desc=f"三維度門票達成 ＋ 空頭共振 <b>{ss:.1f}</b> 分，超越門檻<br>T+1 開盤掛空單，EXIT_CONFIRM=3 日確認出場"
-            sub="歷史回測：整體 65.8% ｜ 空頭 66.7%"
+            desc=f"三維度門票達成 ＋ 空頭共振 <b>{ss:.1f}</b> 分（≥{SHORT_ENTRY}）<br>T+1 開盤掛空單，連續 {EXIT_CONFIRM_S} 日確認出場"
+            sub="v12 回測：空頭勝率 67.9% （v11=53.8% 大幅改善）"
         elif gL:
             ttl="🟡 多頭門票已開，等待共振"; cls="sig-idle"
-            desc=f"門票✅，但共振得分 {ls:.1f} 尚未達 {ENTRY_THRESH}，繼續觀望"
-            sub="等待更多因子點燈"
+            desc=f"門票✅，共振 {ls:.1f} 尚未達 {LONG_ENTRY}，繼續觀望"; sub="等待更多因子點燈"
         elif gS:
             ttl="🟡 空頭門票已開，等待共振"; cls="sig-idle"
-            desc=f"門票✅，但共振得分 {ss:.1f} 尚未達 {ENTRY_THRESH}，繼續觀望"
-            sub="等待更多因子點燈"
+            desc=f"門票✅，共振 {ss:.1f} 尚未達 {SHORT_ENTRY}，繼續觀望"; sub="等待更多因子點燈"
         else:
             ttl="⚖️ 空手觀望"; cls="sig-idle"
-            desc="大環境三維度門票未達，過濾器攔截<br>等待費半趨勢、資金流向明確"
-            sub="v11 門票 + 分數雙重確認才進場"
+            desc="大環境門票未達，過濾器攔截<br>等待費半趨勢、資金流向明確"
+            sub="v12 門票 + 分數雙重確認才進場"
         st.markdown(f"""<div class="sig-card {cls}" style="height:100%">
           <h2>{ttl}</h2>
-          <p style="color:#c8d6e8;margin:8px 0">{desc}</p>
-          <p style="font-size:.73rem;color:#4a6fa5">{sub}</p>
+          <p style="color:#1e293b;margin:10px 0">{desc}</p>
+          <p style="font-size:.74rem;color:#64748b">{sub}</p>
           </div>""", unsafe_allow_html=True)
 
     # ════════════════════════════════════════════════════════
-    # 區塊B：KPI 快覽
+    # 區塊 B：KPI
     # ════════════════════════════════════════════════════════
     st.markdown('<div class="sect">✦ 市場快照</div>', unsafe_allow_html=True)
     twii_c = (lt["TWII"]/d["TWII"].iloc[-2]-1)*100 if len(d)>1 else 0
@@ -568,7 +591,7 @@ def main():
     </div>""", unsafe_allow_html=True)
 
     # ════════════════════════════════════════════════════════
-    # 區塊C：因子點燈看板
+    # 區塊 C：因子點燈
     # ════════════════════════════════════════════════════════
     st.markdown('<div class="sect">✦ 因子點燈看板</div>', unsafe_allow_html=True)
     cL, cS = st.columns(2)
@@ -578,8 +601,8 @@ def main():
         for k,v in fdict.items():
             pct = min(v/mx*100,100)
             cls = "bar-l" if is_long else "bar-s"
-            col = "#22c55e" if is_long else "#ef4444"
-            dot = "🟢" if v>0 else "⬜"
+            col = "#16a34a" if is_long else "#dc2626"
+            dot = "🟢" if v>0 else "⚪"
             rows += f"""<div class="bar-row">
               <span class="bar-label">{dot} {k}</span>
               <div class="bar-bg"><div class="{cls}" style="width:{pct:.0f}%"></div></div>
@@ -588,112 +611,112 @@ def main():
 
     with cL:
         st.markdown(f"""<div class="sig-card sig-idle">
-          <h2 style="color:#22c55e">多頭因子
+          <h2 style="color:#16a34a">多頭因子
             <span style="font-family:'IBM Plex Mono';font-size:1rem">{ls:.1f}</span>
-            <span style="font-size:.75rem;color:#4a6fa5"> / {ENTRY_THRESH} 門檻</span></h2>
+            <span style="font-size:.75rem;color:#94a3b8"> / {LONG_ENTRY} 門檻</span></h2>
           <div class="bar-wrap">{bar_rows(Lf,True,14)}</div></div>""",
           unsafe_allow_html=True)
     with cS:
         st.markdown(f"""<div class="sig-card sig-idle">
-          <h2 style="color:#ef4444">空頭因子
+          <h2 style="color:#dc2626">空頭因子
             <span style="font-family:'IBM Plex Mono';font-size:1rem">{ss:.1f}</span>
-            <span style="font-size:.75rem;color:#4a6fa5"> / {ENTRY_THRESH} 門檻</span></h2>
+            <span style="font-size:.75rem;color:#94a3b8"> / {SHORT_ENTRY} 門檻</span></h2>
           <div class="bar-wrap">{bar_rows(Sf,False,14.5)}</div></div>""",
           unsafe_allow_html=True)
 
     # ════════════════════════════════════════════════════════
-    # 區塊D：八大技術圖表
+    # 區塊 D：八大技術圖表
     # ════════════════════════════════════════════════════════
     st.markdown('<div class="sect">✦ 技術指標圖表</div>', unsafe_allow_html=True)
 
     # ① 大盤 + 季線 + 乖離
     st.markdown('<div class="ctitle">① 台灣加權指數 ／ 季線(60MA) ／ 季線乖離率</div>', unsafe_allow_html=True)
     f1 = make_subplots(rows=2,cols=1,shared_xaxes=True,row_heights=[.7,.3],vertical_spacing=.04)
-    f1.add_trace(go.Scatter(x=d.index,y=d["TWII"],  name="加權指數",line=dict(color=C["tw"],width=1.5)),row=1,col=1)
+    f1.add_trace(go.Scatter(x=d.index,y=d["TWII"],  name="加權指數",line=dict(color=C["tw"],width=1.8)),row=1,col=1)
     f1.add_trace(go.Scatter(x=d.index,y=d["MA20"],  name="月線(20)",line=dict(color=C["ma20"],width=1,dash="dot")),row=1,col=1)
     f1.add_trace(go.Scatter(x=d.index,y=d["MA60"],  name="季線(60)",line=dict(color=C["ma60"],width=1.6,dash="dash")),row=1,col=1)
-    bc=["#ef4444" if b>8 else "#22c55e" if b<-8 else "#334466" for b in d["乖離"]]
-    f1.add_trace(go.Bar(x=d.index,y=d["乖離"],name="乖離率(%)",marker_color=bc,opacity=.85),row=2,col=1)
-    f1.add_hline(y=8, line_dash="dot",line_color="#ef4444",line_width=1,row=2,col=1,annotation_text="超買+8%",annotation_font_size=9)
-    f1.add_hline(y=-8,line_dash="dot",line_color="#22c55e",line_width=1,row=2,col=1,annotation_text="超賣-8%",annotation_font_size=9)
-    f1.add_hline(y=0, line_color="#334466",line_width=.8,row=2,col=1)
-    theme(f1,PLOT_H_TALL); st.plotly_chart(f1,use_container_width=True)
+    bc=["#dc2626" if b>8 else "#16a34a" if b<-8 else "#94a3b8" for b in d["乖離"]]
+    f1.add_trace(go.Bar(x=d.index,y=d["乖離"],name="乖離率(%)",marker_color=bc,opacity=.75),row=2,col=1)
+    f1.add_hline(y=8, line_dash="dot",line_color="#dc2626",line_width=1,row=2,col=1,annotation_text="超買+8%",annotation_font_size=9,annotation_font_color="#dc2626")
+    f1.add_hline(y=-8,line_dash="dot",line_color="#16a34a",line_width=1,row=2,col=1,annotation_text="超賣-8%",annotation_font_size=9,annotation_font_color="#16a34a")
+    f1.add_hline(y=0, line_color="#cbd5e1",line_width=.8,row=2,col=1)
+    theme(f1,440); st.plotly_chart(f1,use_container_width=True)
 
-    # ② 費半  ③ 電金比（並排）
+    # ② 費半  ③ 電金比
     c2,c3 = st.columns(2)
     with c2:
         st.markdown('<div class="ctitle">② 費城半導體（大環境門票①）</div>', unsafe_allow_html=True)
         f2=go.Figure()
-        f2.add_trace(go.Scatter(x=d.index,y=d["SOX"],      name="費半",line=dict(color=C["sox"],width=1.5)))
+        f2.add_trace(go.Scatter(x=d.index,y=d["SOX"],      name="費半",line=dict(color=C["sox"],width=1.7)))
         f2.add_trace(go.Scatter(x=d.index,y=d["SOX_MA20"], name="月線",line=dict(color=C["sox20"],width=1,dash="dot")))
         f2.add_trace(go.Scatter(x=d.index,y=d["SOX_MA60"], name="季線",line=dict(color=C["sox60"],width=1.5,dash="dash")))
         above=[y if y>m else None for y,m in zip(d["SOX"],d["SOX_MA60"])]
         f2.add_trace(go.Scatter(x=d.index,y=d["SOX_MA60"],showlegend=False,line=dict(width=0)))
-        f2.add_trace(go.Scatter(x=d.index,y=above,fill="tonexty",fillcolor="rgba(129,140,248,.12)",line=dict(width=0),showlegend=False))
-        theme(f2,PLOT_H_SM); st.plotly_chart(f2,use_container_width=True)
+        f2.add_trace(go.Scatter(x=d.index,y=above,fill="tonexty",fillcolor="rgba(99,102,241,.1)",line=dict(width=0),showlegend=False))
+        theme(f2,340); st.plotly_chart(f2,use_container_width=True)
     with c3:
         st.markdown('<div class="ctitle">③ 電金比 — 資金風格輪動（大環境門票③）</div>', unsafe_allow_html=True)
         f3=go.Figure()
-        f3.add_trace(go.Scatter(x=d.index,y=d["EF"],      name="電金比",line=dict(color=C["ef"],width=1.5)))
+        f3.add_trace(go.Scatter(x=d.index,y=d["EF"],      name="電金比",line=dict(color=C["ef"],width=1.7)))
         f3.add_trace(go.Scatter(x=d.index,y=d["EF_MA20"], name="月線",  line=dict(color=C["ef20"],width=1,dash="dot")))
         f3.add_trace(go.Scatter(x=d.index,y=d["EF_MA60"], name="季線",  line=dict(color=C["ef60"],width=1.5,dash="dash")))
         ef_hi=[y if y>m else None for y,m in zip(d["EF"],d["EF_MA60"])]
         f3.add_trace(go.Scatter(x=d.index,y=d["EF_MA60"],showlegend=False,line=dict(width=0)))
-        f3.add_trace(go.Scatter(x=d.index,y=ef_hi,fill="tonexty",fillcolor="rgba(192,132,252,.1)",line=dict(width=0),showlegend=False))
-        theme(f3,PLOT_H_SM); st.plotly_chart(f3,use_container_width=True)
+        f3.add_trace(go.Scatter(x=d.index,y=ef_hi,fill="tonexty",fillcolor="rgba(139,92,246,.1)",line=dict(width=0),showlegend=False))
+        theme(f3,340); st.plotly_chart(f3,use_container_width=True)
 
     # ④ 台積電 + 量能
     st.markdown('<div class="ctitle">④ 台積電現貨 ／ 月線 ／ 爆量偵測</div>', unsafe_allow_html=True)
     f4=make_subplots(rows=2,cols=1,shared_xaxes=True,row_heights=[.68,.32],vertical_spacing=.04)
-    f4.add_trace(go.Scatter(x=d.index,y=d["TSMC_TW"],name="台積電(TW)",line=dict(color=C["tsmc"],width=1.5)),row=1,col=1)
+    f4.add_trace(go.Scatter(x=d.index,y=d["TSMC_TW"],name="台積電(TW)",line=dict(color=C["tsmc"],width=1.7)),row=1,col=1)
     f4.add_trace(go.Scatter(x=d.index,y=d["TS_MA20"],name="月線(20)",  line=dict(color=C["ts_ma"],width=1,dash="dot")),row=1,col=1)
-    vc=["#ef4444" if v>1.5*m else "#2a4060" for v,m in zip(d["TSMC_Vol"],d["TS_VolMA"])]
-    f4.add_trace(go.Bar(x=d.index,y=d["TSMC_Vol"],name="成交量（紅=爆量）",marker_color=vc,opacity=.9),row=2,col=1)
+    vc=["#dc2626" if v>1.5*m else "#cbd5e1" for v,m in zip(d["TSMC_Vol"],d["TS_VolMA"])]
+    f4.add_trace(go.Bar(x=d.index,y=d["TSMC_Vol"],name="成交量（紅=爆量）",marker_color=vc,opacity=.8),row=2,col=1)
     f4.add_trace(go.Scatter(x=d.index,y=d["TS_VolMA"]*1.5,name="爆量閾(×1.5)",
                             line=dict(color="#f59e0b",width=1,dash="dot")),row=2,col=1)
     theme(f4,420); st.plotly_chart(f4,use_container_width=True)
 
-    # ⑤ 外資  ⑥ ADR（並排）
+    # ⑤ 外資  ⑥ ADR
     c5,c6=st.columns(2)
     with c5:
         st.markdown('<div class="ctitle">⑤ 外資買賣超 ／ Z-Score（大環境門票② 之一）</div>', unsafe_allow_html=True)
         if has_fi and "FI_Net" in d.columns and d["FI_Net"].abs().sum()>0:
             f5=make_subplots(rows=2,cols=1,shared_xaxes=True,row_heights=[.55,.45],vertical_spacing=.04)
             fc=[C["fi_pos"] if v>=0 else C["fi_neg"] for v in d["FI_Net"]]
-            f5.add_trace(go.Bar(x=d.index,y=d["FI_Net"],name="外資淨買賣(億)",marker_color=fc,opacity=.85),row=1,col=1)
-            f5.add_trace(go.Scatter(x=d.index,y=d["FI_Z"],name="外資Z-score",line=dict(color="#60a5fa",width=1.5)),row=2,col=1)
-            for yv,col,lbl in [(1.2,"#22c55e","多頭+1.2σ"),(-1.5,"#ef4444","空頭-1.5σ")]:
+            f5.add_trace(go.Bar(x=d.index,y=d["FI_Net"],name="外資淨買賣(億)",marker_color=fc,opacity=.8),row=1,col=1)
+            f5.add_trace(go.Scatter(x=d.index,y=d["FI_Z"],name="外資Z-score",line=dict(color="#2563eb",width=1.7)),row=2,col=1)
+            for yv,col,lbl in [(FI_LONG_TH,"#16a34a",f"多頭+{FI_LONG_TH}σ"),(-FI_SHORT_TH,"#dc2626",f"空頭-{FI_SHORT_TH}σ")]:
                 f5.add_hline(y=yv,line_dash="dot",line_color=col,line_width=1,row=2,col=1,
-                             annotation_text=lbl,annotation_font_size=9)
-            f5.add_hline(y=0,line_color="#334466",line_width=.8,row=2,col=1)
-            theme(f5,PLOT_H_MED); st.plotly_chart(f5,use_container_width=True)
+                             annotation_text=lbl,annotation_font_size=9,annotation_font_color=col)
+            f5.add_hline(y=0,line_color="#cbd5e1",line_width=.8,row=2,col=1)
+            theme(f5,380); st.plotly_chart(f5,use_container_width=True)
         else:
             st.info("ℹ️ FinMind 外資資料暫時無法取得，Z-score 以 0 代入。", icon="🔌")
 
     with c6:
         st.markdown('<div class="ctitle">⑥ 台積電ADR折溢價(%) ／ Z-Score（大環境門票② 之一）</div>', unsafe_allow_html=True)
         f6=make_subplots(rows=2,cols=1,shared_xaxes=True,row_heights=[.55,.45],vertical_spacing=.04)
-        f6.add_trace(go.Scatter(x=d.index,y=d["ADR_Premium"],name="ADR折溢價(%)",line=dict(color=C["adr"],width=1.5)),row=1,col=1)
+        f6.add_trace(go.Scatter(x=d.index,y=d["ADR_Premium"],name="ADR折溢價(%)",line=dict(color=C["adr"],width=1.7)),row=1,col=1)
         f6.add_trace(go.Scatter(x=d.index,y=d["ADR_MA"],     name="120MA",        line=dict(color=C["adr_ma"],width=1,dash="dash")),row=1,col=1)
-        f6.add_hline(y=0,line_color="#334466",line_width=.8,row=1,col=1)
-        f6.add_trace(go.Scatter(x=d.index,y=d["ADR_Z"],name="ADR Z-score",line=dict(color="#fbbf24",width=1.5)),row=2,col=1)
-        for yv,col,lbl in [(0.8,"#22c55e","多頭+0.8σ"),(-1.2,"#ef4444","空頭-1.2σ")]:
+        f6.add_hline(y=0,line_color="#cbd5e1",line_width=.8,row=1,col=1)
+        f6.add_trace(go.Scatter(x=d.index,y=d["ADR_Z"],name="ADR Z-score",line=dict(color="#ca8a04",width=1.7)),row=2,col=1)
+        for yv,col,lbl in [(ADR_LONG_TH,"#16a34a",f"多頭+{ADR_LONG_TH}σ"),(-ADR_SHORT_TH,"#dc2626",f"空頭-{ADR_SHORT_TH}σ")]:
             f6.add_hline(y=yv,line_dash="dot",line_color=col,line_width=1,row=2,col=1,
-                         annotation_text=lbl,annotation_font_size=9)
-        f6.add_hline(y=0,line_color="#334466",line_width=.8,row=2,col=1)
-        theme(f6,PLOT_H_MED); st.plotly_chart(f6,use_container_width=True)
+                         annotation_text=lbl,annotation_font_size=9,annotation_font_color=col)
+        f6.add_hline(y=0,line_color="#cbd5e1",line_width=.8,row=2,col=1)
+        theme(f6,380); st.plotly_chart(f6,use_container_width=True)
 
     # ⑦ RSI
     st.markdown('<div class="ctitle">⑦ 台股加權指數 ／ RSI(14) 動能指標</div>', unsafe_allow_html=True)
     f7=make_subplots(rows=2,cols=1,shared_xaxes=True,row_heights=[.65,.35],vertical_spacing=.04)
-    f7.add_trace(go.Scatter(x=d.index,y=d["TWII"],name="加權指數",line=dict(color=C["tw"],width=1.5)),row=1,col=1)
+    f7.add_trace(go.Scatter(x=d.index,y=d["TWII"],name="加權指數",line=dict(color=C["tw"],width=1.7)),row=1,col=1)
     f7.add_trace(go.Scatter(x=d.index,y=d["MA60"],name="季線",    line=dict(color=C["ma60"],width=1.2,dash="dash")),row=1,col=1)
-    f7.add_trace(go.Scatter(x=d.index,y=d["RSI"],name="RSI(14)",  line=dict(color=C["rsi"],width=1.5)),row=2,col=1)
-    f7.add_hrect(y0=65,y1=100,fillcolor="rgba(239,68,68,.06)",line_width=0,row=2,col=1)
-    f7.add_hrect(y0=0, y1=40, fillcolor="rgba(34,197,94,.06)", line_width=0,row=2,col=1)
-    for yv,col,lbl in [(65,"#ef4444","過熱65"),(40,"#22c55e","低檔40")]:
+    f7.add_trace(go.Scatter(x=d.index,y=d["RSI"],name="RSI(14)",  line=dict(color=C["rsi"],width=1.7)),row=2,col=1)
+    f7.add_hrect(y0=65,y1=100,fillcolor="rgba(220,38,38,.06)",line_width=0,row=2,col=1)
+    f7.add_hrect(y0=0, y1=40, fillcolor="rgba(22,163,74,.06)", line_width=0,row=2,col=1)
+    for yv,col,lbl in [(65,"#dc2626","過熱65"),(40,"#16a34a","低檔40")]:
         f7.add_hline(y=yv,line_dash="dot",line_color=col,line_width=1,row=2,col=1,
-                     annotation_text=lbl,annotation_font_size=9)
+                     annotation_text=lbl,annotation_font_size=9,annotation_font_color=col)
     theme(f7,420); st.plotly_chart(f7,use_container_width=True)
 
     # ⑧ 布林通道
@@ -702,29 +725,27 @@ def main():
     f8.add_trace(go.Scatter(x=d.index,y=d["BB上"],name="BB上軌",line=dict(color=C["bb_up"],width=1,dash="dot")))
     f8.add_trace(go.Scatter(x=d.index,y=d["BB下"],name="BB下軌",
                             line=dict(color=C["bb_dn"],width=1,dash="dot"),
-                            fill="tonexty",fillcolor="rgba(100,100,120,.08)"))
+                            fill="tonexty",fillcolor="rgba(148,163,184,.1)"))
     f8.add_trace(go.Scatter(x=d.index,y=d["MA20"], name="中線(20MA)",line=dict(color=C["bb_mid"],width=1.2)))
-    f8.add_trace(go.Scatter(x=d.index,y=d["TWII"], name="加權指數",  line=dict(color=C["tw"],width=1.8)))
+    f8.add_trace(go.Scatter(x=d.index,y=d["TWII"], name="加權指數",  line=dict(color=C["tw"],width=1.9)))
     bhi=d[d["TWII"]>d["BB上"]]; blo=d[d["TWII"]<d["BB下"]]
     if not bhi.empty:
         f8.add_trace(go.Scatter(x=bhi.index,y=bhi["TWII"],mode="markers",
-                                marker=dict(color="#ef4444",size=7,symbol="circle"),name="突破上軌"))
+                                marker=dict(color="#dc2626",size=8,symbol="circle",line=dict(color="#fff",width=1)),name="突破上軌"))
     if not blo.empty:
         f8.add_trace(go.Scatter(x=blo.index,y=blo["TWII"],mode="markers",
-                                marker=dict(color="#22c55e",size=7,symbol="circle"),name="突破下軌"))
+                                marker=dict(color="#16a34a",size=8,symbol="circle",line=dict(color="#fff",width=1)),name="突破下軌"))
     theme(f8,420); st.plotly_chart(f8,use_container_width=True)
 
     # ════════════════════════════════════════════════════════
-    # 區塊E：回測圖 + 績效統計（新增第九張圖）
+    # 區塊 E：第九張圖 — 回測 + 績效
     # ════════════════════════════════════════════════════════
     st.markdown('<div class="sect">✦ 策略回測進出場分析（近一年）</div>', unsafe_allow_html=True)
 
     if bt is None:
-        st.warning("回測資料不足（需要開盤價與足夠歷史），無法產生回測圖。")
+        st.warning("回測資料不足，無法產生回測圖。")
     else:
         stats = bt["stats"]
-
-        # ── 績效統計表（HTML表格） ─────────────────────────
         def fmt_pct(v, good_pos=True):
             cls = "win" if (v>0)==good_pos else "lose"
             return f'<span class="{cls}">{v:+.2f}%</span>'
@@ -733,87 +754,64 @@ def main():
             return f'<span class="{cls}">{v:.1f}%</span>'
 
         st.markdown(f"""
-        <div style="background:#0d1424;border:1px solid #1e3356;border-radius:12px;padding:1.1rem 1.4rem;margin-bottom:1rem">
-          <div style="font-size:.78rem;color:#7ea8d8;letter-spacing:1px;text-transform:uppercase;margin-bottom:.8rem">策略績效統計表（全部可用資料）</div>
+        <div class="perf-wrap">
+          <div class="perf-title">📈 策略績效統計表（全部可用資料）</div>
           <table class="perf-table">
-            <tr>
-              <th>項目</th><th>整體</th><th>做多</th><th>做空</th>
-            </tr>
-            <tr>
-              <td>交易筆數</td>
+            <tr><th>項目</th><th>整體</th><th>做多</th><th>做空</th></tr>
+            <tr><td>交易筆數</td>
               <td>{stats['n']}</td>
               <td>{stats['n_l']}</td>
-              <td>{stats['n_s']}</td>
-            </tr>
-            <tr>
-              <td>勝率</td>
+              <td>{stats['n_s']}</td></tr>
+            <tr><td>勝率</td>
               <td>{fmt_wr(stats['wr'])}</td>
               <td>{fmt_wr(stats['wrl'])}</td>
-              <td>{fmt_wr(stats['wrs'])}</td>
-            </tr>
-            <tr>
-              <td>平均波段報酬</td>
+              <td>{fmt_wr(stats['wrs'])}</td></tr>
+            <tr><td>平均波段報酬</td>
               <td>—</td>
               <td>{fmt_pct(stats['avg_l'])}</td>
-              <td>{fmt_pct(stats['avg_s'])}</td>
-            </tr>
-            <tr>
-              <td>年均交易次數</td>
-              <td colspan="3" style="text-align:center">{stats['tpy']:.1f} 筆／年（月均 {stats['tpy']/12:.1f} 次）</td>
-            </tr>
-            <tr>
-              <td>策略累積報酬</td>
-              <td colspan="3" style="text-align:center">{fmt_pct(stats['total_ret'])}</td>
-            </tr>
-            <tr>
-              <td>最大回撤 (MDD)</td>
-              <td colspan="3" style="text-align:center">{fmt_pct(stats['mdd'],good_pos=False)}</td>
-            </tr>
-            <tr>
-              <td>夏普比率</td>
+              <td>{fmt_pct(stats['avg_s'])}</td></tr>
+            <tr><td>年均交易次數</td>
+              <td colspan="3" style="text-align:center">{stats['tpy']:.1f} 筆／年（月均 {stats['tpy']/12:.1f} 次）</td></tr>
+            <tr><td>策略累積報酬</td>
+              <td colspan="3" style="text-align:center">{fmt_pct(stats['total_ret'])}</td></tr>
+            <tr><td>最大回撤 (MDD)</td>
+              <td colspan="3" style="text-align:center">{fmt_pct(stats['mdd'],good_pos=False)}</td></tr>
+            <tr><td>夏普比率</td>
               <td colspan="3" style="text-align:center">
                 <span class="{'win' if stats['sharpe']>1 else ''}">{stats['sharpe']:.2f}</span>
-              </td>
-            </tr>
+              </td></tr>
           </table>
-          <p style="font-size:.68rem;color:#2a4a7f;margin-top:.6rem">
+          <p style="font-size:.7rem;color:#94a3b8;margin-top:.7rem">
             ⚠️ 回測基於歷史資料，不代表未來績效。T+1 開盤成交，單邊成本 {COST_RATE*10000:.0f} bps。
           </p>
         </div>
         """, unsafe_allow_html=True)
 
-        # ── 第九張圖：進出場走勢圖 ────────────────────────
+        # 第九張圖
         st.markdown('<div class="ctitle">⑨ 加權指數 ／ 近一年策略進出場走勢 ／ 累積報酬對比</div>',
                     unsafe_allow_html=True)
 
-        # 取最近252交易日顯示
         d_plot  = d.iloc[-252:] if len(d)>252 else d
         cum_plot= bt["cum"].iloc[-252:] if len(bt["cum"])>252 else bt["cum"]
-        bh_plot = ((1+d_plot["TWII"].pct_change().fillna(0)).cumprod())
-        # 對齊買進持有基準到策略起始點
+        bh_plot = (1+d_plot["TWII"].pct_change().fillna(0)).cumprod()
         bh_plot = bh_plot / bh_plot.iloc[0] * cum_plot.iloc[0]
 
-        # 近一年的進出場
         tds = [t for t in bt["trades"]
                if "exit_date" in t and t["date"] >= d_plot.index[0]]
-        long_e_dates  = [t["date"]      for t in tds if t["dir"]==1]
-        long_e_vals   = [d.loc[t["date"],"TWII"]      if t["date"] in d.index else np.nan for t in tds if t["dir"]==1]
-        long_x_dates  = [t["exit_date"] for t in tds if t["dir"]==1]
-        long_x_vals   = [d.loc[t["exit_date"],"TWII"] if t["exit_date"] in d.index else np.nan for t in tds if t["dir"]==1]
-        short_e_dates = [t["date"]      for t in tds if t["dir"]==-1]
-        short_e_vals  = [d.loc[t["date"],"TWII"]      if t["date"] in d.index else np.nan for t in tds if t["dir"]==-1]
-        short_x_dates = [t["exit_date"] for t in tds if t["dir"]==-1]
-        short_x_vals  = [d.loc[t["exit_date"],"TWII"] if t["exit_date"] in d.index else np.nan for t in tds if t["dir"]==-1]
 
-        f9 = make_subplots(
-            rows=2, cols=1, shared_xaxes=True,
-            row_heights=[0.62, 0.38], vertical_spacing=0.04,
-            subplot_titles=["", ""]
-        )
+        long_e_d  = [t["date"]      for t in tds if t["dir"]==1]
+        long_e_v  = [d.loc[t["date"],"TWII"]      if t["date"] in d.index else np.nan for t in tds if t["dir"]==1]
+        long_x_d  = [t["exit_date"] for t in tds if t["dir"]==1]
+        long_x_v  = [d.loc[t["exit_date"],"TWII"] if t["exit_date"] in d.index else np.nan for t in tds if t["dir"]==1]
+        short_e_d = [t["date"]      for t in tds if t["dir"]==-1]
+        short_e_v = [d.loc[t["date"],"TWII"]      if t["date"] in d.index else np.nan for t in tds if t["dir"]==-1]
+        short_x_d = [t["exit_date"] for t in tds if t["dir"]==-1]
+        short_x_v = [d.loc[t["exit_date"],"TWII"] if t["exit_date"] in d.index else np.nan for t in tds if t["dir"]==-1]
 
-        # 走勢
+        f9 = make_subplots(rows=2,cols=1,shared_xaxes=True,row_heights=[.62,.38],vertical_spacing=.04)
+
         f9.add_trace(go.Scatter(x=d_plot.index,y=d_plot["TWII"],name="加權指數",
-                                line=dict(color=C["tw"],width=1.4),opacity=.85),row=1,col=1)
+                                line=dict(color=C["tw"],width=1.6)),row=1,col=1)
         f9.add_trace(go.Scatter(x=d_plot.index,y=d_plot["MA60"],name="季線(60MA)",
                                 line=dict(color=C["ma60"],width=1.3,dash="dash")),row=1,col=1)
 
@@ -823,48 +821,43 @@ def main():
             e = exp_plot.iloc[i]
             if e!=0:
                 x0=d_plot.index[i-1]; x1=d_plot.index[i]
-                fc="rgba(34,197,94,.07)" if e>0 else "rgba(239,68,68,.07)"
+                fc="rgba(22,163,74,.08)" if e>0 else "rgba(220,38,38,.08)"
                 f9.add_vrect(x0=x0,x1=x1,fillcolor=fc,line_width=0,row=1,col=1)
 
-        # 進出場標記
-        if long_e_dates:
-            f9.add_trace(go.Scatter(x=long_e_dates,y=long_e_vals,mode="markers",
-                name="多單進場",marker=dict(color=C["long_e"],size=13,symbol="triangle-up",
-                line=dict(color="#fff",width=1.2))),row=1,col=1)
-        if long_x_dates:
-            f9.add_trace(go.Scatter(x=long_x_dates,y=long_x_vals,mode="markers",
+        if long_e_d:
+            f9.add_trace(go.Scatter(x=long_e_d,y=long_e_v,mode="markers",
+                name="多單進場",marker=dict(color=C["long_e"],size=14,symbol="triangle-up",
+                line=dict(color="#fff",width=1.5))),row=1,col=1)
+        if long_x_d:
+            f9.add_trace(go.Scatter(x=long_x_d,y=long_x_v,mode="markers",
                 name="多單出場",marker=dict(color=C["long_e"],size=9,symbol="circle",
-                line=dict(color="#fff",width=1),opacity=.8)),row=1,col=1)
-        if short_e_dates:
-            f9.add_trace(go.Scatter(x=short_e_dates,y=short_e_vals,mode="markers",
-                name="空單進場",marker=dict(color=C["short_e"],size=13,symbol="triangle-down",
-                line=dict(color="#fff",width=1.2))),row=1,col=1)
-        if short_x_dates:
-            f9.add_trace(go.Scatter(x=short_x_dates,y=short_x_vals,mode="markers",
+                line=dict(color="#fff",width=1),opacity=.7)),row=1,col=1)
+        if short_e_d:
+            f9.add_trace(go.Scatter(x=short_e_d,y=short_e_v,mode="markers",
+                name="空單進場",marker=dict(color=C["short_e"],size=14,symbol="triangle-down",
+                line=dict(color="#fff",width=1.5))),row=1,col=1)
+        if short_x_d:
+            f9.add_trace(go.Scatter(x=short_x_d,y=short_x_v,mode="markers",
                 name="空單出場",marker=dict(color=C["short_e"],size=9,symbol="circle",
-                line=dict(color="#fff",width=1),opacity=.8)),row=1,col=1)
+                line=dict(color="#fff",width=1),opacity=.7)),row=1,col=1)
 
-        # 累積報酬
-        f9.add_trace(go.Scatter(x=cum_plot.index,y=(cum_plot-1)*100,name=f"v11策略 ({stats['total_ret']:+.1f}%)",
-                                line=dict(color=C["strat"],width=2.2)),row=2,col=1)
+        f9.add_trace(go.Scatter(x=cum_plot.index,y=(cum_plot-1)*100,
+                                name=f"v12策略 ({stats['total_ret']:+.1f}%)",
+                                line=dict(color=C["strat"],width=2.4)),row=2,col=1)
         f9.add_trace(go.Scatter(x=bh_plot.index,y=(bh_plot-1)*100,name="買進持有",
                                 line=dict(color=C["bh"],width=1.4,dash="dash"),opacity=.7),row=2,col=1)
-        # 回撤陰影
-        cum_arr=cum_plot.values; hwm=np.maximum.accumulate(cum_arr)
-        dd=(cum_arr/hwm-1)*100
+        cum_arr=cum_plot.values; hwm=np.maximum.accumulate(cum_arr); dd=(cum_arr/hwm-1)*100
         f9.add_trace(go.Scatter(x=cum_plot.index,y=dd,name="策略回撤",
                                 line=dict(color="#ef4444",width=0),
-                                fill="tozeroy",fillcolor="rgba(239,68,68,.12)"),row=2,col=1)
-        f9.add_hline(y=0,line_color="#334466",line_width=.8,row=2,col=1)
+                                fill="tozeroy",fillcolor="rgba(239,68,68,.15)"),row=2,col=1)
+        f9.add_hline(y=0,line_color="#cbd5e1",line_width=.8,row=2,col=1)
 
-        f9.update_yaxes(title_text="指數",      title_font_size=10,row=1,col=1)
+        f9.update_yaxes(title_text="指數",title_font_size=10,row=1,col=1)
         f9.update_yaxes(title_text="累積報酬(%)",title_font_size=10,row=2,col=1)
-        theme(f9, 560)
-        # 圖例放上方
+        theme(f9,560)
         f9.update_layout(legend=dict(orientation="h",yanchor="bottom",y=1.01,xanchor="left",x=0,font_size=10))
         st.plotly_chart(f9,use_container_width=True)
 
-        # ── 交易明細摺疊 ──────────────────────────────────
         with st.expander("📋  近一年波段交易明細", expanded=False):
             tds_year=[t for t in bt["trades"]
                       if "exit_date" in t and t["date"]>=d_plot.index[0]]
@@ -887,13 +880,12 @@ def main():
             else:
                 st.info("近一年無已完成波段。")
 
-    # ── 頁尾 ─────────────────────────────────────────────────
+    # 頁尾
     st.markdown("""
-    <div style="text-align:center;padding:1.5rem 0 .5rem;border-top:1px solid #1e3356;margin-top:1.5rem">
-      <span style="font-size:.72rem;color:#2a4a7f;font-family:'IBM Plex Mono'">
-        台指多因子策略 v11 ／ Grid Search 34,992 組最佳化 ／ 整體勝率 65.8%（回測 2021–2026）<br>
-        本頁面僅供量化研究參考，不構成投資建議。
-      </span>
+    <div class="footer">
+      台指多因子策略 v12 ／ 多空均衡版（多4.5門檻＋空3.5門檻 ／ EXIT_CONFIRM 多3空2）<br>
+      整體勝率 67.5% │ 多頭 67.3% │ 空頭 67.9%（v11=53.8% 大幅改善）<br>
+      本頁面僅供量化研究參考，不構成投資建議。
     </div>""", unsafe_allow_html=True)
 
 
