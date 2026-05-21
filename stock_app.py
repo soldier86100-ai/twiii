@@ -31,7 +31,7 @@ st.markdown("""
 [data-testid="stHeader"]            { background:transparent; }
 section.main > div                  { padding-top:.8rem; }
 html, body, [class*="css"]          { font-family:"Noto Sans TC",sans-serif; color:#1e293b; }
-code, .mono                          { font-family:"IBM Plex Mono",monospace; }
+code, .mono                         { font-family:"IBM Plex Mono",monospace; }
 
 /* ── 頂部 Banner ── */
 .top-banner{
@@ -221,6 +221,10 @@ def fetch_yahoo() -> pd.DataFrame:
         df["ADR_Premium"] = (df["TSM_US"] * df["USDTWD"] / 5 / df["TSMC_TW"] - 1) * 100
     else:
         df["ADR_Premium"] = np.nan
+
+    # 防呆機制：如果 Yahoo 沒有抓到 TWII 導致 DataFrame 缺乏 TWII 欄位，直接回傳以避免 KeyError
+    if "TWII" not in df.columns:
+        return pd.DataFrame()
 
     return df.dropna(subset=["TWII"])
 
@@ -424,29 +428,29 @@ def latest_signal(d: pd.DataFrame):
 
     L = {}
     L["F1 趨勢斜率"]   = s((lt["TWII"]>lt["MA60"]) and (lt["斜率"]>0.1),             1.0)
-    L["F2 電金比MA"]   = s(lt["EF"]>lt["EF_MA20"],                                    1.0)
-    L["F3 外資Z"]      = s(lt["FI_Z"]>FI_LONG_TH,                                     2.0)
+    L["F2 電金比MA"]   = s(lt["EF"]>lt["EF_MA20"],                                   1.0)
+    L["F3 外資Z"]      = s(lt["FI_Z"]>FI_LONG_TH,                                    2.0)
     L["F4 費半雙均"]   = s((lt["SOX"]>lt["SOX_MA20"]) and (lt["SOX"]>lt["SOX_MA60"]),2.0)
-    L["F5 ADR溢價Z"]   = s(lt["ADR_Z"]>ADR_LONG_TH,                                   2.0)
-    L["F6 台積電MA"]   = s(lt["TSMC_TW"]>lt["TS_MA20"],                               1.0)
-    L["F7 爆量"]       = s(lt["TSMC_Vol"]>1.5*lt["TS_VolMA"],                          0.5)
-    L["F8 超賣乖離"]   = s(lt["乖離"]<-8,                                              1.0)
-    L["F9 RSI低檔"]    = s(lt["RSI"]<40,                                               1.0)
-    L["F10 外資流入"]  = s(lt["FI_5MA"]>0,                                             1.0)
-    L["F11 BB下軌"]    = s(lt["TWII"]<lt["BB下"],                                      0.5)
+    L["F5 ADR溢價Z"]   = s(lt["ADR_Z"]>ADR_LONG_TH,                                  2.0)
+    L["F6 台積電MA"]   = s(lt["TSMC_TW"]>lt["TS_MA20"],                              1.0)
+    L["F7 爆量"]       = s(lt["TSMC_Vol"]>1.5*lt["TS_VolMA"],                        0.5)
+    L["F8 超賣乖離"]   = s(lt["乖離"]<-8,                                            1.0)
+    L["F9 RSI低檔"]    = s(lt["RSI"]<40,                                             1.0)
+    L["F10 外資流入"]  = s(lt["FI_5MA"]>0,                                           1.0)
+    L["F11 BB下軌"]    = s(lt["TWII"]<lt["BB下"],                                    0.5)
 
     S = {}
     S["F1 趨勢斜率"]   = s((lt["TWII"]<lt["MA60"]) and (lt["斜率"]<-0.1),             1.5)
-    S["F2 電金比MA"]   = s(lt["EF"]<lt["EF_MA20"],                                    1.0)
-    S["F3 外資Z"]      = s(lt["FI_Z"]<-FI_SHORT_TH,                                   2.0)
+    S["F2 電金比MA"]   = s(lt["EF"]<lt["EF_MA20"],                                   1.0)
+    S["F3 外資Z"]      = s(lt["FI_Z"]<-FI_SHORT_TH,                                  2.0)
     S["F4 費半雙均"]   = s((lt["SOX"]<lt["SOX_MA20"]) and (lt["SOX"]<lt["SOX_MA60"]),2.0)
-    S["F5 ADR折價Z"]   = s(lt["ADR_Z"]<-ADR_SHORT_TH,                                 2.0)
-    S["F6 台積電MA"]   = s(lt["TSMC_TW"]<lt["TS_MA20"],                               1.0)
-    S["F7 爆量"]       = s(lt["TSMC_Vol"]>1.5*lt["TS_VolMA"],                          0.5)
-    S["F8 超買乖離"]   = s(lt["乖離"]>8,                                               1.0)
-    S["F9 RSI高檔"]    = s(lt["RSI"]>65,                                               1.0)
-    S["F10 外資流出"]  = s(lt["FI_5MA"]<0,                                             1.0)
-    S["F11 BB上軌"]    = s(lt["TWII"]>lt["BB上"],                                      0.5)
+    S["F5 ADR折價Z"]   = s(lt["ADR_Z"]<-ADR_SHORT_TH,                                2.0)
+    S["F6 台積電MA"]   = s(lt["TSMC_TW"]<lt["TS_MA20"],                              1.0)
+    S["F7 爆量"]       = s(lt["TSMC_Vol"]>1.5*lt["TS_VolMA"],                        0.5)
+    S["F8 超買乖離"]   = s(lt["乖離"]>8,                                             1.0)
+    S["F9 RSI高檔"]    = s(lt["RSI"]>65,                                             1.0)
+    S["F10 外資流出"]  = s(lt["FI_5MA"]<0,                                           1.0)
+    S["F11 BB上軌"]    = s(lt["TWII"]>lt["BB上"],                                    0.5)
 
     ls = sum(L.values()); ss_ = sum(S.values())
     gL = ((lt["SOX"]>lt["SOX_MA20"] and lt["SOX"]>lt["SOX_MA60"]) and
